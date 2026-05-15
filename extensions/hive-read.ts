@@ -34,8 +34,14 @@ interface ModelOutput {
 	errorMessage?: string;
 }
 
+// mtime-based cache: avoid re-parsing huge session files on repeated hive_read calls
+const _cache = new Map<string, { mtime: number; outputs: ModelOutput[] }>();
+
 function findLastHiveResult(sessionPath: string): ModelOutput[] | null {
 	if (!fs.existsSync(sessionPath)) return null;
+	const stat = fs.statSync(sessionPath);
+	const cached = _cache.get(sessionPath);
+	if (cached && cached.mtime === stat.mtimeMs) return cached.outputs;
 
 	const raw = fs.readFileSync(sessionPath, "utf-8");
 	const lines = raw.split("\n");
@@ -77,6 +83,7 @@ function findLastHiveResult(sessionPath: string): ModelOutput[] | null {
 				errorMessage: r.errorMessage,
 			});
 		}
+		_cache.set(sessionPath, { mtime: stat.mtimeMs, outputs });
 		return outputs;
 	}
 
@@ -134,7 +141,7 @@ export default function (pi: ExtensionAPI) {
 			const limit = (params.limit as number) ?? 150;
 
 			// Find current session file
-			const sessionPath = ctx.sessionPath;
+			const sessionPath = ctx.sessionManager.getSessionFile();
 			if (!sessionPath) {
 				return { content: [{ type: "text", text: "No active session found." }], isError: true };
 			}
@@ -148,8 +155,8 @@ export default function (pi: ExtensionAPI) {
 			let filtered = outputs;
 			if (targetModel) {
 				// Try index first
-				const idx = parseInt(targetModel, 10);
-				if (!isNaN(idx) && idx >= 0 && idx < outputs.length) {
+				const idx = Number(targetModel);
+				if (Number.isInteger(idx) && idx >= 0 && idx < outputs.length) {
 					filtered = [outputs[idx]];
 				} else {
 					filtered = outputs.filter(
