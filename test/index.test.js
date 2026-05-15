@@ -320,3 +320,148 @@ describe("Param validation", function () {
 		assert.equal(validateParams({ question: "test", cwd: 123 }).valid, false);
 	});
 });
+
+// ---------------------------------------------------------------------------
+// hive-read helpers (inlined from extensions/hive-read.ts)
+// ---------------------------------------------------------------------------
+
+function extractAnswer(text) {
+	const start = text.lastIndexOf("<ANSWER>");
+	if (start === -1) return null;
+	const end = text.lastIndexOf("</ANSWER>");
+	if (end === -1) return text.slice(start + 8).trim();
+	return text.slice(start + 8, end).trim();
+}
+
+function findLastHiveResult(messages) {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (msg.role !== "toolResult") continue;
+		const d = msg.details;
+		if (d && d.question && d.models && d.results) return d;
+	}
+	return null;
+}
+
+function modelOutputsFromDetails(details) {
+	return details.results.map(function (r) {
+		let text = "";
+		for (let j = r.messages.length - 1; j >= 0; j--) {
+			const m = r.messages[j];
+			if (m.role === "assistant") {
+				for (const c of m.content || []) {
+					if (c.type === "text") { text = c.text; break; }
+				}
+				if (text) break;
+			}
+		}
+		return {
+			model: r.model,
+			exitCode: r.exitCode,
+			durationMs: r.durationMs,
+			turns: (r.usage && r.usage.turns) || 0,
+			text,
+			errorMessage: r.errorMessage,
+		};
+	});
+}
+
+describe("extractAnswer", function () {
+	it("extracts content between ANSWER tags", function () {
+		const result = extractAnswer("some thinking\n<ANSWER>\nhello world\n</ANSWER>\nmore");
+		assert.equal(result, "hello world");
+	});
+
+	it("handles unclosed ANSWER tag", function () {
+		const result = extractAnswer("thinking\n<ANSWER>\npartial");
+		assert.equal(result, "partial");
+	});
+
+	it("returns null when no ANSWER tag", function () {
+		assert.equal(extractAnswer("just text"), null);
+	});
+
+	it("uses lastIndexOf to get final ANSWER (not first)", function () {
+		const result = extractAnswer("<ANSWER>ignored</ANSWER>\nmiddle\n<ANSWER>correct</ANSWER>");
+		assert.equal(result, "correct");
+	});
+
+	it("handles empty ANSWER", function () {
+		assert.equal(extractAnswer("<ANSWER></ANSWER>"), "");
+	});
+});
+
+describe("findLastHiveResult", function () {
+	it("finds the last hive_think tool result by details shape", function () {
+		const msgs = [
+			{ role: "user", content: [{ type: "text", text: "hi" }] },
+			{ role: "toolResult", details: { question: "Q1", models: ["a"], results: [] } },
+			{ role: "toolResult", details: { question: "Q2", models: ["b"], results: [] } },
+		];
+		const r = findLastHiveResult(msgs);
+		assert.ok(r);
+		assert.equal(r.question, "Q2");
+	});
+
+	it("skips non-toolResult messages", function () {
+		const msgs = [
+			{ role: "user", content: [] },
+			{ role: "assistant", content: [{ type: "text", text: "ok" }] },
+			{ role: "toolResult", details: { question: "Q", models: ["x"], results: [] } },
+		];
+		const r = findLastHiveResult(msgs);
+		assert.ok(r);
+		assert.equal(r.question, "Q");
+	});
+
+	it("returns null when no hive result present", function () {
+		const msgs = [
+			{ role: "user", content: [] },
+			{ role: "toolResult", details: { other: true } },
+		];
+		assert.equal(findLastHiveResult(msgs), null);
+	});
+
+	it("returns null for empty array", function () {
+		assert.equal(findLastHiveResult([]), null);
+	});
+});
+
+describe("modelOutputsFromDetails", function () {
+	it("extracts text from last assistant message of each result", function () {
+		const details = {
+			question: "Q",
+			models: ["m1", "m2"],
+			results: [
+				{ model: "m1", exitCode: 0, durationMs: 1000, messages: [
+					{ role: "assistant", content: [{ type: "text", text: "output1" }] }
+				], usage: { turns: 2 } },
+				{ model: "m2", exitCode: 0, durationMs: 2000, messages: [
+					{ role: "assistant", content: [{ type: "text", text: "output2" }] }
+				], usage: { turns: 3 } },
+			],
+		};
+		const outputs = modelOutputsFromDetails(details);
+		assert.equal(outputs.length, 2);
+		assert.equal(outputs[0].model, "m1");
+		assert.equal(outputs[0].text, "output1");
+		assert.equal(outputs[0].turns, 2);
+		assert.equal(outputs[1].model, "m2");
+		assert.equal(outputs[1].text, "output2");
+		assert.equal(outputs[1].turns, 3);
+	});
+
+	it("handles errorMessage on result", function () {
+		const details = {
+			question: "Q",
+			models: ["m1"],
+			results: [
+				{ model: "m1", exitCode: 1, durationMs: 0, messages: [],
+				  errorMessage: "timeout", usage: {} },
+			],
+		};
+		const outputs = modelOutputsFromDetails(details);
+		assert.equal(outputs[0].text, "");
+		assert.equal(outputs[0].errorMessage, "timeout");
+	});
+});

@@ -2,14 +2,13 @@
  * hive-read — Read and paginate hive_think results
  *
  * Companion tool for hive-think. Reads model outputs from the most recent
- * hive_think result in the current session.
+ * hive_think result directly from ctx.messages — no file I/O needed.
  *
  * Two modes:
  *   extract_answer=true  — extract only the <ANSWER>...</ANSWER> section
- *   extract_answer=false — show full output with pagination
+ *   extract_answer=false — show full output with per-model pagination
  */
 
-import * as fs from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -18,10 +17,10 @@ import { Type } from "typebox";
 // ---------------------------------------------------------------------------
 
 function extractAnswer(text: string): string | null {
-	const start = text.indexOf("<ANSWER>");
+	const start = text.lastIndexOf("<ANSWER>");
 	if (start === -1) return null;
-	const end = text.indexOf("</ANSWER>", start + 8);
-	if (end === -1) return text.slice(start); // unclosed — return from <ANSWER> to end
+	const end = text.lastIndexOf("</ANSWER>");
+	if (end === -1) return text.slice(start + 8).trim();
 	return text.slice(start + 8, end).trim();
 }
 
@@ -34,60 +33,55 @@ interface ModelOutput {
 	errorMessage?: string;
 }
 
-// mtime-based cache: avoid re-parsing huge session files on repeated hive_read calls
-const _cache = new Map<string, { mtime: number; outputs: ModelOutput[] }>();
+interface HiveDetails {
+	question: string;
+	models: string[];
+	results: Array<{
+		model: string;
+		exitCode: number;
+		durationMs: number;
+		messages: Array<any>;
+		usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: number; totalTokens?: number; turns?: number };
+		errorMessage?: string;
+	}>;
+}
 
-function findLastHiveResult(sessionPath: string): ModelOutput[] | null {
-	if (!fs.existsSync(sessionPath)) return null;
-	const stat = fs.statSync(sessionPath);
-	const cached = _cache.get(sessionPath);
-	if (cached && cached.mtime === stat.mtimeMs) return cached.outputs;
-
-	const raw = fs.readFileSync(sessionPath, "utf-8");
-	const lines = raw.split("\n");
-
-	// Walk backwards to find the most recent hive_think result
-	for (let i = lines.length - 1; i >= 0; i--) {
-		const line = lines[i].trim();
-		if (!line) continue;
-
-		let msg: any;
-		try { msg = JSON.parse(line); } catch { continue; }
-
-		const details = msg?.message?.details;
-		if (!details) continue;
-		if (!details.question || !details.models || !details.results) continue;
-
-		// Found a hive_think result
-		const outputs: ModelOutput[] = [];
-		for (const r of details.results) {
-			let text = "";
-			for (let j = r.messages.length - 1; j >= 0; j--) {
-				const m = r.messages[j];
-				if (m.role === "assistant") {
-					for (const c of m.content ?? []) {
-						if (c.type === "text") {
-							text = c.text;
-							break;
-						}
-					}
-					if (text) break;
-				}
-			}
-			outputs.push({
-				model: r.model,
-				exitCode: r.exitCode,
-				durationMs: r.durationMs,
-				turns: r.usage?.turns ?? 0,
-				text,
-				errorMessage: r.errorMessage,
-			});
+function findLastHiveResult(messages: any[]): HiveDetails | null {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (msg.role !== "toolResult") continue;
+		const details = msg.details as HiveDetails | undefined;
+		if (details?.question && details?.models && details?.results) {
+			return details;
 		}
-		_cache.set(sessionPath, { mtime: stat.mtimeMs, outputs });
-		return outputs;
 	}
-
 	return null;
+}
+
+function modelOutputsFromDetails(details: HiveDetails): ModelOutput[] {
+	return details.results.map((r) => {
+		let text = "";
+		for (let j = r.messages.length - 1; j >= 0; j--) {
+			const m = r.messages[j];
+			if (m.role === "assistant") {
+				for (const c of m.content ?? []) {
+					if (c.type === "text") {
+						text = c.text;
+						break;
+					}
+				}
+				if (text) break;
+			}
+		}
+		return {
+			model: r.model,
+			exitCode: r.exitCode,
+			durationMs: r.durationMs,
+			turns: r.usage?.turns ?? 0,
+			text,
+			errorMessage: r.errorMessage,
+		};
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -114,7 +108,7 @@ const HiveReadParams = Type.Object({
 	limit: Type.Optional(
 		Type.Number({
 			default: 150,
-			description: "Max lines to return (default 150, only when extract_answer=false).",
+			description: "Max lines to return per model (default 150, only when extract_answer=false).",
 		}),
 	),
 });
@@ -128,59 +122,56 @@ export default function (pi: ExtensionAPI) {
 		name: "hive_read",
 		label: "Hive Read",
 		description: [
-			"Read model outputs from the most recent hive_think result.",
+			"Read model outputs from the most recent hive_think result in ctx.messages.",
 			"Two modes: extract_answer=true (default) returns only the ANSWER section;",
-			"extract_answer=false returns full output with line-based pagination.",
+			"extract_answer=false returns full output with per-model line-based pagination.",
 			"Use this instead of reading the raw session file (1.4MB+ per hive call).",
 		].join(" "),
 		parameters: HiveReadParams,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const targetModel = (params.model as string) ?? "";
 			const extract = params.extract_answer !== false;
 			const offset = (params.offset as number) ?? 0;
 			const limit = (params.limit as number) ?? 150;
 
-			// Find current session file
-			const sessionPath = ctx.sessionManager.getSessionFile();
-			if (!sessionPath) {
-				return { content: [{ type: "text", text: "No active session found." }], isError: true };
+			const messages = ctx.messages ?? [];
+			if (messages.length === 0) {
+				return { content: [{ type: "text", text: "No messages in this session." }] };
 			}
 
-			const outputs = findLastHiveResult(sessionPath);
-			if (!outputs || outputs.length === 0) {
-				return { content: [{ type: "text", text: "No hive_think result found in this session." }] };
+			const details = findLastHiveResult(messages);
+			if (!details) {
+				return { content: [{ type: "text", text: "No hive_think result found in current session. Try running hive_think first." }] };
 			}
+
+			const allOutputs = modelOutputsFromDetails(details);
 
 			// Filter by model
-			let filtered = outputs;
+			let filtered = allOutputs;
 			if (targetModel) {
-				// Try index first
 				const idx = Number(targetModel);
-				if (Number.isInteger(idx) && idx >= 0 && idx < outputs.length) {
-					filtered = [outputs[idx]];
+				if (Number.isInteger(idx) && idx >= 0 && idx < allOutputs.length) {
+					filtered = [allOutputs[idx]];
 				} else {
-					filtered = outputs.filter(
-						(o) => o.model.includes(targetModel),
-					);
+					filtered = allOutputs.filter((o) => o.model.includes(targetModel));
 				}
 			}
 
 			if (filtered.length === 0) {
 				return {
-					content: [
-						{
-							type: "text",
-							text: `Model "${targetModel}" not found. Available: ${outputs.map((o) => o.model).join(", ")}`,
-						},
-					],
+					content: [{
+						type: "text",
+						text: `Model "${targetModel}" not found. Available: ${allOutputs.map((o) => o.model).join(", ")}`,
+					}],
 				};
 			}
 
 			// Build output
 			const parts: string[] = [];
-			parts.push(
-				`${filtered.length === outputs.length ? `All ${outputs.length} models` : `Model: ${targetModel}`} from last hive_think`,
-			);
+			const scope = filtered.length === allOutputs.length
+				? `All ${allOutputs.length} models`
+				: `Model${filtered.length > 1 ? "s" : ""}: ${targetModel}`;
+			parts.push(`${scope} from last hive_think (question: "${details.question.slice(0, 80)}...")`);
 
 			for (const o of filtered) {
 				const status = o.exitCode === 0 ? "✓" : "✗";
@@ -194,15 +185,14 @@ export default function (pi: ExtensionAPI) {
 					} else if (answer) {
 						parts.push(answer);
 					} else {
-						parts.push("(no ANSWER section found — try extract_answer=false)");
+						parts.push("(no ANSWER section — try extract_answer=false)");
 					}
 				} else {
-					// Full output with pagination
 					const lines = o.text.split("\n");
 					const page = lines.slice(offset, offset + limit);
 					parts.push(`\n### ${o.model} ${status} ${duration}`);
 					if (o.errorMessage) parts.push(`Error: ${o.errorMessage}`);
-					parts.push(`(lines ${offset + 1}-${Math.min(offset + limit, lines.length)} of ${lines.length})`);
+					parts.push(`(lines ${offset + 1}-${Math.min(offset + limit, lines.length)} of ${lines.length}${offset + limit < lines.length ? `, use offset=${offset + limit} for next page` : ""})`);
 					parts.push(page.join("\n") || "(no output)");
 				}
 			}
@@ -210,9 +200,7 @@ export default function (pi: ExtensionAPI) {
 			// Summary footer
 			if (extract && filtered.length > 1) {
 				const answered = filtered.filter((o) => extractAnswer(o.text) !== null).length;
-				parts.push(
-					`\n---\n${answered}/${filtered.length} models produced ANSWER section. Use extract_answer=false + offset/limit for full output.`,
-				);
+				parts.push(`\n---\n${answered}/${filtered.length} models produced ANSWER section. Use extract_answer=false for full output.`);
 			}
 
 			return { content: [{ type: "text", text: parts.join("\n") }] };
