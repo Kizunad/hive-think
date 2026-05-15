@@ -33,12 +33,31 @@ pi config
 # Disable "hive-think-autopilot" in the extensions panel
 ```
 
+### Read results
+
+After a hive_think call, use `hive_read` to inspect individual model outputs without digging through the raw session file:
+
+```
+# Read ANSWER sections from all 8 models
+hive_read({})
+
+# Read just the deepseek-v4-pro models' ANSWER
+hive_read({ model: "deepseek-v4-pro" })
+
+# Read model at index 3 (0-based)
+hive_read({ model: "3" })
+
+# Full output with pagination (instead of ANSWER extraction)
+hive_read({ extract_answer: false, offset: 0, limit: 200 })
+```
+
 ## What's included
 
 | Component | File | Description |
 |-----------|------|-------------|
 | Main extension | `extensions/hive-think.ts` | Registers `hive_think` tool, spawns 8 parallel pi subprocesses |
 | Autopilot | `extensions/hive-think-autopilot.ts` | Injects usage guidance into system prompt |
+| Result reader | `extensions/hive-read.ts` | Reads model outputs from session with ANSWER extraction + pagination |
 | Prompt template | `prompts/hive.md` | `/hive` slash command for manual invocation |
 
 ## Architecture

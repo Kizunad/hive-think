@@ -10,7 +10,8 @@
   "pi": {
     "extensions": [
       "./extensions/hive-think.ts",
-      "./extensions/hive-think-autopilot.ts"
+      "./extensions/hive-think-autopilot.ts",
+      "./extensions/hive-read.ts"
     ],
     "prompts": ["./prompts"]
   },
