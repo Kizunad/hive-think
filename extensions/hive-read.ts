@@ -46,28 +46,23 @@ interface HiveDetails {
 	}>;
 }
 
-function findLastHiveResult(messages: any[]): HiveDetails | null {
-	// Search messages bottom-up — check both top-level details and nested content blocks
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		// Check top-level details (toolResult messages from built-in tools)
+function findLastHiveResult(entries: any[]): HiveDetails | null {
+	// Search entries bottom-up for hive_think results
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (entry.type !== "message") continue;
+		const msg = entry.message;
+		if (!msg) continue;
+		// Check top-level details (toolResult messages)
 		if (msg.details?.question && msg.details?.models && msg.details?.results) {
 			return msg.details as HiveDetails;
 		}
-		// Check content blocks (extension tool results embedded in assistant/user messages)
+		// Check content blocks (extension tool results embedded in assistant messages)
 		const content = msg.content;
 		if (Array.isArray(content)) {
 			for (const block of content) {
 				if (block?.details?.question && block?.details?.models && block?.details?.results) {
 					return block.details as HiveDetails;
-				}
-				// Check nested text content that might contain serialized details
-				if (block?.content && Array.isArray(block.content)) {
-					for (const inner of block.content) {
-						if (inner?.details?.question && inner?.details?.models && inner?.details?.results) {
-							return inner.details as HiveDetails;
-						}
-					}
 				}
 			}
 		}
@@ -139,10 +134,9 @@ export default function (pi: ExtensionAPI) {
 		name: "hive_read",
 		label: "Hive Read",
 		description: [
-			"Read model outputs from the most recent hive_think result in ctx.messages.",
+			"Read model outputs from the most recent hive_think result in the session.",
 			"Two modes: extract_answer=true (default) returns only the ANSWER section;",
 			"extract_answer=false returns full output with per-model line-based pagination.",
-			"Use this instead of reading the raw session file (1.4MB+ per hive call).",
 		].join(" "),
 		parameters: HiveReadParams,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -151,23 +145,18 @@ export default function (pi: ExtensionAPI) {
 			const offset = (params.offset as number) ?? 0;
 			const limit = (params.limit as number) ?? 150;
 
-			const messages = ctx.messages ?? [];
-			if (messages.length === 0) {
-				return { content: [{ type: "text", text: "No messages in this session." }] };
+			const entries = ctx.sessionManager?.getEntries?.() ?? [];
+			if (entries.length === 0) {
+				return { content: [{ type: "text", text: "No entries in this session. Try running hive_think first." }] };
 			}
 
-			const details = findLastHiveResult(messages);
+			const details = findLastHiveResult(entries);
 			if (!details) {
-				// Show what we found for debugging
-				const counts = { total: messages.length, withDetails: 0, withContent: 0 };
-				for (const m of messages) {
-					if (m.details) counts.withDetails++;
-					if (Array.isArray(m.content)) counts.withContent++;
-				}
+				const messageEntries = entries.filter((e: any) => e.type === "message").length;
 				return {
 					content: [{
 						type: "text",
-						text: `No hive_think result found in current session. Messages: ${counts.total} total, ${counts.withDetails} with details, ${counts.withContent} with content array. Try running hive_think first, then hive_read in the same session.`,
+						text: `No hive_think result found in session. Found ${entries.length} entries (${messageEntries} messages). Try running hive_think first.`,
 					}],
 				};
 			}
