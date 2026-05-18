@@ -6,6 +6,14 @@
  * Each model thinks independently. The main agent compares all perspectives
  * and makes the final decision.
  *
+ * Modes (biologically inspired):
+ *   parallel         — simple parallel (original)
+ *   global_workspace — GWT: competition + broadcast
+ *   cortical_column  — hierarchical abstraction layers
+ *   waggle_dance     — scout → recruit → converge
+ *   integrate_fire   — evidence accumulation with adaptive depth
+ *   dmn_tpn          — free association ↔ focused analysis
+ *
  * Install: pi install git:github.com/.../hive-think
  */
 
@@ -13,7 +21,6 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, getMarkdownTheme, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
@@ -22,8 +29,6 @@ import { Type } from "typebox";
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-// Concurrency = number of models (all run in parallel)
 
 // Hive composition: 4 strong + 4 fast scouts = 8 models, all --thinking xhigh
 export const DEFAULT_MODELS = [
@@ -40,8 +45,25 @@ export const DEFAULT_MODELS = [
 const HIVE_TOOLS = "read,grep,find,ls,bash";
 export const ANSWER_END = "</ANSWER>";
 
-// Max concurrent pi subprocesses — avoids rate-limiting when all models hit same DeepSeek API key
+// Max concurrent pi subprocesses
 const MAX_CONCURRENCY = 4;
+
+// ---------------------------------------------------------------------------
+// Mode metadata
+// ---------------------------------------------------------------------------
+
+const MODE_META: Record<string, { emoji: string; label: string; description: string }> = {
+	parallel: { emoji: "🐝", label: "Hive Think", description: "Simple parallel — all models think independently (original mode, 8 calls)" },
+	global_workspace: { emoji: "🧠", label: "Global Workspace", description: "2-round competition+broadcast, iterative convergence (11 calls)" },
+	cortical_column: { emoji: "🧱", label: "Cortical Column", description: "Hierarchical layers with bidirectional feedback (7 calls)" },
+	waggle_dance: { emoji: "💃", label: "Waggle Dance", description: "Scout diverse directions, converge on best (8 calls)" },
+	integrate_fire: { emoji: "⚡", label: "Integrate-Fire", description: "All specialists think twice, second pass builds on first (13 calls)" },
+	dmn_tpn: { emoji: "🌊", label: "DMN/TPN", description: "Free association ↔ focused analysis cycles (11 calls)" },
+};
+
+// ---------------------------------------------------------------------------
+// System prompts
+// ---------------------------------------------------------------------------
 
 const HIVE_SYSTEM_PROMPT = `You are in HIVE THINK mode — a deep, multi-perspective analytical mode for complex software decisions.
 
@@ -215,11 +237,12 @@ interface ModelResult {
 interface HiveThinkDetails {
 	question: string;
 	models: string[];
+	mode?: string;
 	results: ModelResult[];
 }
 
 // ---------------------------------------------------------------------------
-// Model runner
+// Model runner (core)
 // ---------------------------------------------------------------------------
 
 async function runModel(
@@ -230,6 +253,7 @@ async function runModel(
 	defaultCwd: string,
 	cwd: string | undefined,
 	signal: AbortSignal | undefined,
+	customSystemPrompt?: string,
 ): Promise<ModelResult> {
 	const args: string[] = [
 		"--mode", "json",
@@ -255,12 +279,12 @@ async function runModel(
 	};
 
 	try {
-		const tmp = await writePromptToTempFile(HIVE_SYSTEM_PROMPT);
+		const promptContent = customSystemPrompt ?? HIVE_SYSTEM_PROMPT;
+		const tmp = await writePromptToTempFile(promptContent);
 		tmpPromptDir = tmp.dir;
 		tmpPromptPath = tmp.filePath;
 		args.push("--append-system-prompt", tmpPromptPath);
 
-		// Build the task: history first, then context, then the question
 		const taskParts: string[] = [];
 		if (history && history.trim()) {
 			taskParts.push("## Full Conversation History", history.trim());
@@ -314,7 +338,6 @@ async function runModel(
 						if (msg.stopReason) result.stopReason = msg.stopReason;
 						if (msg.errorMessage) result.errorMessage = msg.errorMessage;
 
-						// Early resolve: if answer delimiter found in any text part
 						for (const part of msg.content) {
 							if (part.type === "text" && (part as any).text?.includes(ANSWER_END)) {
 								resolved = true;
@@ -365,7 +388,6 @@ async function runModel(
 		result.exitCode = exitCode;
 		result.durationMs = Date.now() - startTime;
 
-		// Fallback: if process failed and no parsed error, surface stderr
 		if (!result.errorMessage && result.stderr.trim()) {
 			const firstLine = result.stderr.trim().split("\n")[0].slice(0, 120);
 			result.errorMessage = `stderr: ${firstLine}`;
@@ -375,14 +397,47 @@ async function runModel(
 		return result;
 	} finally {
 		if (tmpPromptPath)
-			try {
-				fs.unlinkSync(tmpPromptPath);
-			} catch { /* ignore */ }
+			try { fs.unlinkSync(tmpPromptPath); } catch { /* ignore */ }
 		if (tmpPromptDir)
-			try {
-				fs.rmdirSync(tmpPromptDir);
-			} catch { /* ignore */ }
+			try { fs.rmdirSync(tmpPromptDir); } catch { /* ignore */ }
 	}
+}
+
+async function runModelWithTask(
+	model: string,
+	task: string,
+	specificQuestion: string,
+	question: string,
+	context: string,
+	history: string,
+	defaultCwd: string,
+	cwd: string | undefined,
+	signal: AbortSignal | undefined,
+	priorFindings?: string,
+): Promise<ModelResult> {
+	const priorBlock = priorFindings
+		? `\n## Prior Findings (from other analysts)\n${priorFindings}\n\nBuild upon or challenge these findings.`
+		: "";
+	const prompt = `${HIVE_SYSTEM_PROMPT}\n\n## Your Task: ${task}\n**What you must answer**: ${specificQuestion}${priorBlock}\n\nFocus on your question. Be specific and evidence-based.`;
+	return runModel(model, question, context, history, defaultCwd, cwd, signal, prompt);
+}
+
+function buildResult(
+	mode: string,
+	question: string,
+	models: string[],
+	allResults: ModelResult[],
+	finalText: string,
+): { details: HiveThinkDetails; output: string } {
+	const meta = MODE_META[mode];
+	const emoji = meta?.emoji || "🐝";
+	const label = meta?.label || mode;
+	const successCount = allResults.filter((r) => r.exitCode === 0).length;
+	const totalDurationMs = allResults.reduce((s, r) => s + r.durationMs, 0);
+	return {
+		details: { question, models, mode, results: allResults },
+		output: `${emoji} ${label} — ${successCount}/${allResults.length} calls in ${(totalDurationMs / 1000).toFixed(1)}s\n\n${finalText}`,
+	};
 }
 
 export async function mapWithConcurrencyLimit<TIn, TOut>(
@@ -405,6 +460,527 @@ export async function mapWithConcurrencyLimit<TIn, TOut>(
 	return results;
 }
 
+function buildHistory(ctxMessages: Message[]): string {
+	let history = (ctxMessages ?? [])
+		.map((m: Message) => {
+			const roleTag = m.role === "user" ? "[User]" : m.role === "assistant" ? "[Assistant]" : `[${m.role}]`;
+			const textParts = (m.content ?? [])
+				.filter((p: any) => p.type === "text")
+				.map((p: any) => p.text)
+				.join("\n");
+			if (!textParts) return null;
+			return `${roleTag}: ${textParts}`;
+		})
+		.filter(Boolean)
+		.join("\n\n");
+
+	const MAX_HISTORY_CHARS = 512_000;
+	if (history.length > MAX_HISTORY_CHARS) {
+		history = "... [earlier messages truncated]\n\n" + history.slice(history.length - MAX_HISTORY_CHARS);
+	}
+	return history;
+}
+
+// ===========================================================================
+// MODE: parallel (original simple parallel)
+// ===========================================================================
+
+async function executeParallel(
+	models: string[],
+	question: string,
+	context: string,
+	history: string,
+	cwd: string,
+	paramsCwd: string | undefined,
+	signal: AbortSignal | undefined,
+	onUpdate: ((update: any) => void) | undefined,
+): Promise<{ details: HiveThinkDetails; output: string }> {
+	const allResults: ModelResult[] = new Array(models.length);
+	for (let i = 0; i < models.length; i++) {
+		allResults[i] = {
+			model: models[i], exitCode: -1, durationMs: 0, messages: [], stderr: "",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+		};
+	}
+
+	const emitUpdate = () => {
+		if (onUpdate) {
+			const running = allResults.filter((r) => r.exitCode === -1).length;
+			const done = allResults.filter((r) => r.exitCode !== -1).length;
+			onUpdate({
+				content: [{ type: "text", text: `🐝 Hive thinking... ${done}/${models.length} done, ${running} running` }],
+				details: { question, models, results: [...allResults] },
+			});
+		}
+	};
+
+	emitUpdate();
+
+	const results = await mapWithConcurrencyLimit(models, MAX_CONCURRENCY, async (model, index) => {
+		const result = await runModel(model, question, context, history, cwd, paramsCwd, signal);
+		allResults[index] = result;
+		emitUpdate();
+		return result;
+	});
+
+	const successCount = results.filter((r) => r.exitCode === 0).length;
+	const totalDurationMs = results.reduce((s, r) => s + r.durationMs, 0);
+	const summaries = results.map((r) => {
+		const output = getFinalOutput(r.messages);
+		const duration = r.durationMs > 0 ? ` [${(r.durationMs / 1000).toFixed(1)}s]` : "";
+		const preview = output.slice(0, 120) + (output.length > 120 ? "..." : "");
+		return `### ${r.model} ${r.exitCode === 0 ? "✓" : "✗"}${duration}\n${preview || "(no output)"}`;
+	});
+
+	return {
+		details: { question, models, mode: "parallel", results },
+		output: `🐝 Hive Think — ${successCount}/${results.length} models completed in ${(totalDurationMs / 1000).toFixed(1)}s total\n\n${summaries.join("\n\n")}`,
+	};
+}
+
+// ===========================================================================
+// MODE: global_workspace (GWT) — 2-round competition + broadcast
+// ===========================================================================
+
+async function executeGlobalWorkspace(
+	models: string[],
+	question: string,
+	context: string,
+	history: string,
+	cwd: string,
+	paramsCwd: string | undefined,
+	signal: AbortSignal | undefined,
+	onUpdate: ((update: any) => void) | undefined,
+): Promise<{ details: HiveThinkDetails; output: string }> {
+	const NUM_ROUNDS = 2;
+	const allResults: ModelResult[] = [];
+
+	// Define specialists with concrete tasks (not role labels)
+	const specialists: { model: string; task: string; question: string }[] = [
+		{ model: models[0] || "deepseek-v4-pro", task: "System Architecture", question: "What architectural patterns, module boundaries, and design decisions are optimal? Consider coupling, cohesion, and future evolution." },
+		{ model: models[1] || "deepseek-v4-pro", task: "Performance & Scalability", question: "What are the performance implications, bottlenecks, and scaling limits? What throughput/latency trade-offs exist?" },
+		{ model: models[2] || "deepseek-v4-pro", task: "Security & Correctness", question: "What are the attack surfaces, data integrity risks, failure modes, and correctness guarantees?" },
+		{ model: models[3] || "deepseek-v4-flash", task: "Developer Experience", question: "How simple is this to understand, test, debug, and onboard new developers? What's the learning curve?" },
+		{ model: models[4] || "deepseek-v4-flash", task: "Risk Analysis", question: "What edge cases, migration risks, unknown unknowns, and worst-case scenarios must be considered?" },
+	];
+
+	let broadcast = ""; // In-memory workspace — accumulates key insights
+
+	for (let round = 0; round < NUM_ROUNDS; round++) {
+		if (onUpdate) onUpdate({
+			content: [{ type: "text", text: `🧠 GWT Round ${round + 1}/${NUM_ROUNDS} — specialists analyzing...` }],
+			details: { question, models, mode: "global_workspace", results: [...allResults] },
+		});
+
+		// Phase 1: specialists produce proposals (parallel)
+		const proposals = await mapWithConcurrencyLimit(specialists, MAX_CONCURRENCY, async (spec) => {
+			return runModelWithTask(
+				spec.model, spec.task, spec.question,
+				round === 0 ? question : `[Round ${round + 1}] ${question}`,
+				round === 0 ? context : `${context}\n\n## Previous Broadcast (Round 1)\n${broadcast}`,
+				history, cwd, paramsCwd, signal,
+				round > 0 ? broadcast : undefined,
+			);
+		});
+
+		for (const r of proposals) allResults.push(r);
+
+		// Phase 2: arbiter (strong model) selects and synthesizes the winner
+		const proposalTexts = proposals
+			.filter((p) => p.exitCode === 0)
+			.map((p, i) => `### ${specialists[i]?.task ?? "analyst"}\n${getFinalOutput(p.messages)}`)
+			.join("\n\n---\n\n");
+
+		if (proposalTexts && round === 0) {
+			const arbiterResult = await runModel(
+				models[0] || "deepseek-v4-pro", // Use strong model for arbiter
+				`Synthesize the most important insight from round ${round + 1}`,
+				`## Specialist Analyses\n${proposalTexts.slice(0, 15000)}\n\nIdentify the 2-3 most critical, non-obvious insights. Write them as clear, concise bullet points (max 500 words total).`,
+				"", cwd, paramsCwd, signal,
+			);
+			allResults.push(arbiterResult);
+			broadcast = getFinalOutput(arbiterResult.messages);
+		}
+	}
+
+	// Final synthesis
+	const allOutputs = allResults
+		.filter((r) => r.exitCode === 0)
+		.map((r) => getFinalOutput(r.messages))
+		.join("\n\n---\n\n");
+
+	const finalResult = await runModel(
+		models[0] || "deepseek-v4-pro",
+		`Synthesize final recommendation from the global workspace`,
+		`## Round 1 Broadcast\n${broadcast.slice(0, 5000)}\n\n## Round 2 Analyses\n${allOutputs.slice(0, 12000)}\n\n## Original Question\n${question}`,
+		history, cwd, paramsCwd, signal,
+	);
+	allResults.push(finalResult);
+
+	return buildResult("global_workspace", question, models, allResults, getFinalOutput(finalResult.messages));
+}
+
+// ===========================================================================
+// MODE: cortical_column (hierarchical layers)
+// ===========================================================================
+
+async function executeCorticalColumn(
+	models: string[],
+	question: string,
+	context: string,
+	history: string,
+	cwd: string,
+	paramsCwd: string | undefined,
+	signal: AbortSignal | undefined,
+	onUpdate: ((update: any) => void) | undefined,
+): Promise<{ details: HiveThinkDetails; output: string }> {
+	const allResults: ModelResult[] = [];
+	const m = (i: number) => models[i] || "deepseek-v4-pro";
+
+	type Layer = { name: string; model: string; task: string; question: string };
+	const layers: Layer[] = [
+		{ name: "concrete", model: m(5), task: "Code-Level Facts", question: "Read source files, check types, list dependencies, run tests. Report FACTS only: dependencies, type signatures, test results, current file structure." },
+		{ name: "tactical", model: m(4), task: "Implementation Tactics", question: "Based on the concrete facts above, analyze: API design, data flow, module interfaces, error handling patterns. What are the tactical problems and opportunities?" },
+		{ name: "architectural", model: m(1), task: "System Architecture", question: "Based on the tactical analysis, evaluate: module boundaries, coupling/cohesion, design patterns, architectural fitness. Propose architectural options with trade-offs." },
+		{ name: "strategic", model: m(0), task: "Strategic Decision", question: "Based on the architectural analysis, decide: long-term maintainability, team scalability, migration paths, business alignment. Give a definitive recommendation with rationale." },
+	];
+
+	const layerOutputs: Record<string, string> = {};
+
+	if (onUpdate) onUpdate({
+		content: [{ type: "text", text: "🧱 Cortical Column — bottom-up feed-forward pass..." }],
+		details: { question, models, mode: "cortical_column", results: [] },
+	});
+
+	// Phase 1: Feed-forward (bottom-up)
+	for (const layer of layers) {
+		const lowerContext = Object.entries(layerOutputs)
+			.map(([name, out]) => `## ${name} layer findings\n${out}`)
+			.join("\n\n");
+
+		const result = await runModelWithTask(
+			layer.model, layer.task, layer.question,
+			question,
+			`${context}\n\n## Lower Layer Findings\n${lowerContext || "(none — this is the first layer)"}`,
+			history, cwd, paramsCwd, signal,
+			lowerContext || undefined,
+		);
+		allResults.push(result);
+		layerOutputs[layer.name] = getFinalOutput(result.messages);
+	}
+
+	// Phase 2: Top-down feedback (only if strategic/architectural produced constraints)
+	if (onUpdate) onUpdate({
+		content: [{ type: "text", text: "🧱 Cortical Column — top-down feedback pass..." }],
+		details: { question, models, mode: "cortical_column", results: [...allResults] },
+	});
+
+	const strategicConstraints = `## Strategic Constraints\n${layerOutputs["strategic"]}\n\n## Architectural Constraints\n${layerOutputs["architectural"]}`;
+
+	for (const layer of layers.filter(l => l.name === "concrete" || l.name === "tactical")) {
+		const result = await runModelWithTask(
+			layer.model, `${layer.task} (Revised)`, `Revise: ${layer.question}`,
+			question,
+			`${context}\n\n## Top-Down Constraints\n${strategicConstraints}\n\n## Your Previous ${layer.name} Analysis\n${layerOutputs[layer.name]}`,
+			history, cwd, paramsCwd, signal,
+			strategicConstraints,
+		);
+		allResults.push(result);
+		layerOutputs[`${layer.name}_revised`] = getFinalOutput(result.messages);
+	}
+
+	// Final synthesis
+	const allOut = Object.entries(layerOutputs).map(([k, v]) => `## ${k}\n${v}`).join("\n\n");
+	const synthesis = await runModel(
+		m(0),
+		`Synthesize the full cortical column analysis`,
+		`## All Layer Outputs\n${allOut}\n\n## Original Question\n${question}`,
+		history, cwd, paramsCwd, signal,
+	);
+	allResults.push(synthesis);
+
+	return buildResult("cortical_column", question, models, allResults, getFinalOutput(synthesis.messages));
+}
+
+// ===========================================================================
+// MODE: waggle_dance — simplified: scout → converge
+// ===========================================================================
+
+async function executeWaggleDance(
+	models: string[],
+	question: string,
+	context: string,
+	history: string,
+	cwd: string,
+	paramsCwd: string | undefined,
+	signal: AbortSignal | undefined,
+	onUpdate: ((update: any) => void) | undefined,
+): Promise<{ details: HiveThinkDetails; output: string }> {
+	const allResults: ModelResult[] = [];
+	const m = (i: number) => models[i] || "deepseek-v4-flash";
+
+	if (onUpdate) onUpdate({
+		content: [{ type: "text", text: "💃 Waggle Dance — scouting diverse directions..." }],
+		details: { question, models, mode: "waggle_dance", results: [] },
+	});
+
+	// Round 1: Scout — each model explores a DISTINCT creative direction
+	const directions = [
+		"Explore the most RADICAL approach — something unconventional that might seem crazy at first.",
+		"Explore the SIMPLEST possible approach — what's the minimal viable solution?",
+		"Explore the most ROBUST approach — optimize for correctness and reliability above all else.",
+		"Explore the most SCALABLE approach — design for 10x growth from day one.",
+		"Explore the most DEVELOPER-FRIENDLY approach — optimize for readability, testability, and onboarding.",
+		"Explore the most COST-EFFECTIVE approach — minimize infrastructure, maintenance, and operational burden.",
+		"Explore a HYBRID approach — combine the best ideas from multiple paradigms.",
+		"Explore a FUTURE-PROOF approach — anticipate where the technology/domain is heading in 3 years.",
+	];
+
+	const scoutModels = models.slice(0, directions.length);
+	const scouts = await mapWithConcurrencyLimit(scoutModels, MAX_CONCURRENCY, async (model, i) => {
+		const dir = directions[i] || directions[directions.length - 1];
+		return runModelWithTask(
+			model, `Scout: ${dir}`, dir,
+			question, context, history, cwd, paramsCwd, signal,
+		);
+	});
+
+	for (const s of scouts) allResults.push(s);
+
+	// Collect all scout findings
+	const scoutFindings = scouts
+		.filter((r) => r.exitCode === 0)
+		.map((r, i) => `### Approach ${i + 1}: ${directions[i]}\n${getFinalOutput(r.messages)}`)
+		.join("\n\n---\n\n");
+
+	if (onUpdate) onUpdate({
+		content: [{ type: "text", text: "💃 Waggle Dance — converging on best approach..." }],
+		details: { question, models, mode: "waggle_dance", results: [...allResults] },
+	});
+
+	// Round 2: Converge — one strong model evaluates all approaches and synthesizes
+	const converger = await runModel(
+		m(0),
+		`Evaluate all approaches and synthesize the best recommendation`,
+		`## All Scout Approaches\n${scoutFindings.slice(0, 20000)}\n\n## Original Question\n${question}\n\nYour task:\n1. Rank the approaches by overall merit\n2. Identify the strongest ideas from each\n3. Synthesize a final recommendation that combines the best elements\n4. Explain why the chosen combination is superior to any single approach`,
+		history, cwd, paramsCwd, signal,
+	);
+	allResults.push(converger);
+
+	return buildResult("waggle_dance", question, models, allResults, getFinalOutput(converger.messages));
+}
+
+// ===========================================================================
+// MODE: integrate_fire — all specialists think twice, second pass builds on first
+// ===========================================================================
+
+async function executeIntegrateFire(
+	models: string[],
+	question: string,
+	context: string,
+	history: string,
+	cwd: string,
+	paramsCwd: string | undefined,
+	signal: AbortSignal | undefined,
+	onUpdate: ((update: any) => void) | undefined,
+): Promise<{ details: HiveThinkDetails; output: string }> {
+	const allResults: ModelResult[] = [];
+	const NUM_ROUNDS = 2;
+
+	// Define specialists with concrete questions
+	const specialists: { model: string; task: string; question: string }[] = [
+		{ model: models[0] || "deepseek-v4-pro", task: "Architecture", question: "What is the optimal system design? Consider patterns, modularity, coupling, and evolution." },
+		{ model: models[1] || "deepseek-v4-pro", task: "Performance", question: "What are the performance characteristics, bottlenecks, and scaling considerations?" },
+		{ model: models[2] || "deepseek-v4-pro", task: "Security", question: "What are the security implications, attack surfaces, and correctness guarantees?" },
+		{ model: models[3] || "deepseek-v4-flash", task: "Developer Experience", question: "How easy is this to build, test, debug, and onboard? What's the DX trade-off?" },
+		{ model: models[4] || "deepseek-v4-flash", task: "Risk", question: "What are the edge cases, failure modes, and worst-case scenarios?" },
+		{ model: models[5] || "deepseek-v4-flash", task: "Cost & Maintenance", question: "What is the implementation cost, operational burden, and long-term maintenance profile?" },
+	];
+
+	// Round 1: First pass — all specialists produce initial analysis
+	if (onUpdate) onUpdate({
+		content: [{ type: "text", text: `⚡ Integrate-Fire Round 1/${NUM_ROUNDS} — first pass...` }],
+		details: { question, models, mode: "integrate_fire", results: [] },
+	});
+
+	const firstPass = await mapWithConcurrencyLimit(specialists, MAX_CONCURRENCY, async (spec) => {
+		return runModelWithTask(spec.model, spec.task, spec.question, question, context, history, cwd, paramsCwd, signal);
+	});
+
+	for (const r of firstPass) allResults.push(r);
+
+	// Collect first-pass findings for cross-pollination
+	const firstPassFindings = firstPass
+		.filter((r) => r.exitCode === 0)
+		.map((r, i) => `### ${specialists[i]?.task ?? "analyst"}\n${getFinalOutput(r.messages)}`)
+		.join("\n\n---\n\n");
+
+	// Round 2: Second pass — each specialist refines based on all round-1 findings
+	if (onUpdate) onUpdate({
+		content: [{ type: "text", text: `⚡ Integrate-Fire Round 2/${NUM_ROUNDS} — refining...` }],
+		details: { question, models, mode: "integrate_fire", results: [...allResults] },
+	});
+
+	const secondPass = await mapWithConcurrencyLimit(specialists, MAX_CONCURRENCY, async (spec, i) => {
+		return runModelWithTask(
+			spec.model,
+			`${spec.task} (Refined)`,
+			`Refine your analysis. Given what OTHER specialists found:\n\n${firstPassFindings.slice(0, 12000)}\n\nYour refined question: ${spec.question}`,
+			question,
+			context,
+			history, cwd, paramsCwd, signal,
+			firstPassFindings.slice(0, 8000),
+		);
+	});
+
+	for (const r of secondPass) allResults.push(r);
+
+	// Final synthesis from all second-pass results
+	const allRefined = secondPass
+		.filter((r) => r.exitCode === 0)
+		.map((r, i) => `### ${specialists[i]?.task ?? "analyst"} (refined)\n${getFinalOutput(r.messages)}`)
+		.join("\n\n---\n\n");
+
+	const synthesis = await runModel(
+		models[0] || "deepseek-v4-pro",
+		`Synthesize the final recommendation`,
+		`## All Refined Analyses\n${allRefined.slice(0, 15000)}\n\n## Original Question\n${question}\n\nSynthesize a definitive recommendation. Address points of consensus and disagreement among the specialists.`,
+		history, cwd, paramsCwd, signal,
+	);
+	allResults.push(synthesis);
+
+	return buildResult("integrate_fire", question, models, allResults, getFinalOutput(synthesis.messages));
+}
+
+// ===========================================================================
+// MODE: dmn_tpn (Default Mode / Task Positive Network alternation)
+// ===========================================================================
+
+async function executeDMNTPN(
+	models: string[],
+	question: string,
+	context: string,
+	history: string,
+	cwd: string,
+	paramsCwd: string | undefined,
+	signal: AbortSignal | undefined,
+	onUpdate: ((update: any) => void) | undefined,
+): Promise<{ details: HiveThinkDetails; output: string }> {
+	const allResults: ModelResult[] = [];
+	const m = (i: number) => models[i] || (i % 2 === 0 ? "deepseek-v4-pro" : "deepseek-v4-flash");
+
+	// Phase 1: DMN — Free Association (3 models)
+	if (onUpdate) onUpdate({
+		content: [{ type: "text", text: "🌊 DMN Phase 1 — free association..." }],
+		details: { question, models, mode: "dmn_tpn", results: [] },
+	});
+
+	const dmn1Prompt = `DEFAULT MODE NETWORK PHASE: Free Association
+
+You are in a creative, unrestricted brainstorming mode. Rules:
+- NO judgment, NO filtering, NO evaluation
+- Generate as many ideas, associations, and hunches as possible
+- Wild ideas are welcome — don't self-censor
+- Write in stream-of-consciousness style
+- Quantity over quality at this stage
+- Tag interesting ideas with [INTERESTING]
+
+Wrap your free association in <ANSWER>...</ANSWER>.`;
+
+	const dmn1Models = [m(4), m(5), m(6)];
+
+	const dmn1Results = await mapWithConcurrencyLimit(dmn1Models, MAX_CONCURRENCY, async (model) => {
+		return runModelWithTask(model, "Free Association", "Generate as many unconventional ideas as possible", question,
+			`${context}\n\n${dmn1Prompt}`, history, cwd, paramsCwd, signal);
+	});
+	for (const r of dmn1Results) allResults.push(r);
+
+	// Phase 2: TPN — Focused evaluation (5 models)
+	if (onUpdate) onUpdate({
+		content: [{ type: "text", text: "🌊 TPN Phase 2 — focused evaluation..." }],
+		details: { question, models, mode: "dmn_tpn", results: [...allResults] },
+	});
+
+	const dmnOutput = dmn1Results
+		.filter((r) => r.exitCode === 0)
+		.map((r) => getFinalOutput(r.messages))
+		.join("\n\n---\n\n");
+
+	const tpnPrompt = `TASK POSITIVE NETWORK PHASE: Focused Evaluation
+
+You are in rigorous analytical mode. Review the free association output below and:
+1. Identify the 3-5 most promising ideas
+2. Evaluate each against constraints
+3. Cross-reference ideas — which complement each other?
+4. Rank by feasibility and impact
+5. Identify any critical gaps
+
+Be precise, critical, and evidence-based. No brainstorming — pure analysis.
+
+## Free Association Output
+${dmnOutput.slice(0, 10000)}`;
+
+	const tpnModels = [m(0), m(1), m(2), m(3), m(7) || m(5)];
+
+	const tpnResults = await mapWithConcurrencyLimit(tpnModels, MAX_CONCURRENCY, async (model) => {
+		return runModelWithTask(model, "Focused Evaluation", "Rigorously evaluate the free association ideas: identify top 3-5, rank by feasibility/impact, cross-reference", question,
+			`${context}\n\n${tpnPrompt}`, history, cwd, paramsCwd, signal,
+			dmnOutput.slice(0, 5000));
+	});
+	for (const r of tpnResults) allResults.push(r);
+
+	// Phase 3: DMN again — Divergent refinement
+	if (onUpdate) onUpdate({
+		content: [{ type: "text", text: "🌊 DMN Phase 3 — divergent refinement..." }],
+		details: { question, models, mode: "dmn_tpn", results: [...allResults] },
+	});
+
+	const tpnOutput = tpnResults
+		.filter((r) => r.exitCode === 0)
+		.map((r) => getFinalOutput(r.messages))
+		.join("\n\n---\n\n");
+
+	const dmn2Prompt = `DEFAULT MODE NETWORK PHASE: Divergent Refinement
+
+Based on the rigorous evaluation below, freely associate again:
+- What was missed? What assumptions were challenged?
+- Are there synthesis ideas that combine multiple evaluated approaches?
+- Any "obvious but overlooked" solutions?
+
+## Evaluation Results
+${tpnOutput.slice(0, 8000)}`;
+
+	const dmn2Models = [m(5), m(6)];
+
+	const dmn2Results = await mapWithConcurrencyLimit(dmn2Models, MAX_CONCURRENCY, async (model) => {
+		return runModelWithTask(model, "Divergent Refinement", "After seeing the rigorous evaluation, what was missed? What synthesis ideas emerge? Any overlooked solutions?", question,
+			`${context}\n\n${dmn2Prompt}`, history, cwd, paramsCwd, signal,
+			tpnOutput.slice(0, 5000));
+	});
+	for (const r of dmn2Results) allResults.push(r);
+
+	// Phase 4: TPN — Final synthesis
+	if (onUpdate) onUpdate({
+		content: [{ type: "text", text: "🌊 TPN Phase 4 — final synthesis..." }],
+		details: { question, models, mode: "dmn_tpn", results: [...allResults] },
+	});
+
+	const dmn2Output = dmn2Results
+		.filter((r) => r.exitCode === 0)
+		.map((r) => getFinalOutput(r.messages))
+		.join("\n\n---\n\n");
+
+	const finalResult = await runModel(
+		m(0),
+		`Synthesize the full DMN → TPN → DMN → TPN analysis`,
+		`## Phase 1: Free Association\n${dmnOutput.slice(0, 5000)}\n\n## Phase 2: Evaluation\n${tpnOutput.slice(0, 5000)}\n\n## Phase 3: Divergent Refinement\n${dmn2Output.slice(0, 5000)}\n\n## Original Question\n${question}\n\nProduce the definitive recommendation. Reference specific ideas from the DMN phases that were validated by TPN analysis.`,
+		history, cwd, paramsCwd, signal,
+	);
+	allResults.push(finalResult);
+
+	return buildResult("dmn_tpn", question, models, allResults, getFinalOutput(finalResult.messages));
+}
+
 // ---------------------------------------------------------------------------
 // Parameter schema
 // ---------------------------------------------------------------------------
@@ -421,6 +997,13 @@ export const HiveThinkParams = Type.Object({
 		Type.Array(Type.String(), {
 			description:
 				"Model names to use. Default: 4×deepseek-v4-pro + 4×deepseek-v4-flash (all with --thinking xhigh, tools: read,grep,find,ls,bash)",
+		}),
+	),
+	mode: Type.Optional(
+		Type.String({
+			default: "parallel",
+			description:
+				"Thinking paradigm: 'parallel' (default, 8 calls), 'global_workspace' (🧠 2-round competition+broadcast, 11 calls), 'cortical_column' (🧱 hierarchical layers+bidi feedback, 7 calls), 'waggle_dance' (💃 scout diverse→converge, 8 calls), 'integrate_fire' (⚡ 2-pass refinement, 13 calls), 'dmn_tpn' (🌊 free↔focused alternation, 11 calls)",
 		}),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the subprocesses" })),
@@ -446,93 +1029,33 @@ export default function (pi: ExtensionAPI) {
 			const models: string[] = params.models && params.models.length > 0 ? params.models : DEFAULT_MODELS;
 			const question: string = params.question;
 			const context: string = params.context ?? "";
+			const mode: string = (params.mode as string) || "parallel";
 
-			// Serialize full conversation history for hive subprocesses
-			let history = (ctx.messages ?? [])
-				.map((m: Message) => {
-					const roleTag = m.role === "user" ? "[User]" : m.role === "assistant" ? "[Assistant]" : `[${m.role}]`;
-					const textParts = (m.content ?? [])
-						.filter((p: any) => p.type === "text")
-						.map((p: any) => p.text)
-						.join("\n");
-					if (!textParts) return null;
-					return `${roleTag}: ${textParts}`;
-				})
-				.filter(Boolean)
-				.join("\n\n");
-
-			// Cap at ~128k tokens (rough: 1 token ≈ 4 chars → 512k chars)
-			const MAX_HISTORY_CHARS = 512_000;
-			if (history.length > MAX_HISTORY_CHARS) {
-				history = "... [earlier messages truncated]\n\n" + history.slice(history.length - MAX_HISTORY_CHARS);
+			if (!MODE_META[mode]) {
+				throw new Error(`Unknown mode "${mode}". Available: ${Object.keys(MODE_META).join(", ")}`);
 			}
 
-			// Track all results for streaming updates
-			const allResults: ModelResult[] = new Array(models.length);
-			for (let i = 0; i < models.length; i++) {
-				allResults[i] = {
-					model: models[i],
-					exitCode: -1,
-					durationMs: 0,
-					messages: [],
-					stderr: "",
-					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-				};
-			}
+			const history = buildHistory(ctx.messages ?? []);
 
-			const emitUpdate = () => {
-				if (onUpdate) {
-					const running = allResults.filter((r) => r.exitCode === -1).length;
-					const done = allResults.filter((r) => r.exitCode !== -1).length;
-					onUpdate({
-						content: [
-							{
-								type: "text",
-								text: `🐝 Hive thinking... ${done}/${models.length} done, ${running} running`,
-							},
-						],
-						details: {
-							question,
-							models,
-							results: [...allResults],
-						},
-					});
-				}
+			const executors: Record<string, typeof executeParallel> = {
+				parallel: executeParallel,
+				global_workspace: executeGlobalWorkspace,
+				cortical_column: executeCorticalColumn,
+				waggle_dance: executeWaggleDance,
+				integrate_fire: executeIntegrateFire,
+				dmn_tpn: executeDMNTPN,
 			};
+			const executor = executors[mode];
+			if (!executor) throw new Error(`Mode "${mode}" not implemented yet.`);
 
-			emitUpdate();
-
-			const results = await mapWithConcurrencyLimit(models, MAX_CONCURRENCY, async (model, index) => {
-				const result = await runModel(model, question, context, history, ctx.cwd, params.cwd, signal);
-				allResults[index] = result;
-				emitUpdate();
-				return result;
-			});
-
-			const successCount = results.filter((r) => r.exitCode === 0).length;
-			const totalDurationMs = results.reduce((s, r) => s + r.durationMs, 0);
-			const summaries = results.map((r) => {
-				const output = getFinalOutput(r.messages);
-				const duration = r.durationMs > 0 ? ` [${(r.durationMs / 1000).toFixed(1)}s]` : "";
-				const preview = output.slice(0, 120) + (output.length > 120 ? "..." : "");
-				return `### ${r.model} ${r.exitCode === 0 ? "✓" : "✗"}${duration}\n${preview || "(no output)"}`;
-			});
-
-			const details: HiveThinkDetails = { question, models, results };
-
-			return {
-				content: [
-					{
-						type: "text",
-						text: `🐝 Hive Think — ${successCount}/${results.length} models completed in ${(totalDurationMs / 1000).toFixed(1)}s total\n\n${summaries.join("\n\n")}`,
-					},
-				],
-				details,
-			};
+			const { details, output } = await executor(models, question, context, history, ctx.cwd, params.cwd, signal, onUpdate);
+			return { content: [{ type: "text", text: output }], details };
 		},
 
 		renderCall(args, theme, _context) {
 			const models: string[] = (args.models as string[]) ?? DEFAULT_MODELS;
+			const mode: string = (args.mode as string) || "parallel";
+			const emoji = MODE_META[mode]?.emoji || "🐝";
 			const question = (args.question as string) || "...";
 			const preview = question.length > 80 ? `${question.slice(0, 80)}...` : question;
 
@@ -543,8 +1066,8 @@ export default function (pi: ExtensionAPI) {
 
 			let text =
 				theme.fg("toolTitle", theme.bold("hive_think ")) +
-				theme.fg("accent", `🐝 ${models.length} models`) +
-				theme.fg("muted", ` [xhigh · read,bash]`) +
+				theme.fg("accent", `${emoji} ${models.length} models`) +
+				theme.fg("muted", ` [${mode} · xhigh · read,bash]`) +
 				`\n  ${theme.fg("dim", modelSummary)}`;
 			text += `\n  ${theme.fg("dim", preview)}`;
 
@@ -559,6 +1082,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const mdTheme = getMarkdownTheme();
+			const mode = details.mode || "parallel";
+			const emoji = MODE_META[mode]?.emoji || "🐝";
 
 			const aggregateUsage = (results: ModelResult[]) => {
 				const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
@@ -590,16 +1115,14 @@ export default function (pi: ExtensionAPI) {
 				const container = new Container();
 				container.addChild(
 					new Text(
-						`${icon} ${theme.fg("toolTitle", theme.bold("Hive Think "))}${theme.fg("accent", status)}`,
-						0,
-						0,
+						`${icon} ${theme.fg("toolTitle", theme.bold("Hive Think "))}${theme.fg("accent", `${emoji} ${mode} — ${status}`)}`,
+						0, 0,
 					),
 				);
 				container.addChild(
 					new Text(
 						theme.fg("muted", "Models: ") + theme.fg("dim", details.models.join(", ")),
-						0,
-						0,
+						0, 0,
 					),
 				);
 				container.addChild(new Spacer(1));
@@ -614,12 +1137,10 @@ export default function (pi: ExtensionAPI) {
 
 					container.addChild(new Spacer(1));
 					const durationTag = r.durationMs > 0 ? ` ${theme.fg("dim", `[${(r.durationMs / 1000).toFixed(1)}s]`)}` : "";
-					const sessionTag = r.sessionId ? ` ${theme.fg("dim", `session:${r.sessionId.slice(0, 8)}...`)}` : "";
 					container.addChild(
 						new Text(
-							`${theme.fg("muted", "─── ")}${theme.fg("accent", r.model)} ${rIcon}${durationTag}${sessionTag}${usageStr ? theme.fg("dim", `  ${usageStr}`) : ""}`,
-							0,
-							0,
+							`${theme.fg("muted", "─── ")}${theme.fg("accent", r.model)} ${rIcon}${durationTag}${usageStr ? theme.fg("dim", `  ${usageStr}`) : ""}`,
+							0, 0,
 						),
 					);
 
@@ -642,36 +1163,25 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Collapsed view
-			let text = `${icon} ${theme.fg("toolTitle", theme.bold("Hive Think "))}${theme.fg("accent", status)}`;
-			for (const r of details.results) {
-				const rIcon =
-					r.exitCode === -1
-						? theme.fg("warning", "⏳")
-						: r.exitCode === 0
-							? theme.fg("success", "✓")
-							: theme.fg("error", "✗");
+			let text = `${icon} ${theme.fg("toolTitle", theme.bold("Hive Think "))}${theme.fg("accent", `${emoji} ${mode} — ${status}`)}`;
+			for (const r of details.results.slice(0, 5)) {
+				const rIcon = r.exitCode === -1 ? theme.fg("warning", "⏳")
+					: r.exitCode === 0 ? theme.fg("success", "✓")
+					: theme.fg("error", "✗");
 				const output = getFinalOutput(r.messages);
-				const lines = output
-					.split("\n")
-					.filter((l) => l.trim())
-					.slice(0, 3)
-					.map((l) => l.replace(/^#+\s*/, ""))
-					.join(" ");
+				const lines = output.split("\n").filter((l) => l.trim()).slice(0, 3)
+					.map((l) => l.replace(/^#+\s*/, "")).join(" ");
 				const preview = lines.slice(0, 120) + (lines.length > 120 ? "..." : "");
 
 				text += `\n  ${rIcon} ${theme.fg("accent", r.model)}`;
-				if (r.durationMs > 0) {
-					text += ` ${theme.fg("dim", `[${(r.durationMs / 1000).toFixed(1)}s]`)}`;
-				}
-				if (r.exitCode === -1) {
-					text += ` ${theme.fg("dim", "(running...)")}`;
-				} else if (preview.trim()) {
-					text += ` ${theme.fg("dim", preview.trim())}`;
-				} else if (r.errorMessage) {
-					text += ` ${theme.fg("error", r.errorMessage)}`;
-				} else {
-					text += ` ${theme.fg("muted", "(no output)")}`;
-				}
+				if (r.durationMs > 0) text += ` ${theme.fg("dim", `[${(r.durationMs / 1000).toFixed(1)}s]`)}`;
+				if (r.exitCode === -1) text += ` ${theme.fg("dim", "(running...)")}`;
+				else if (preview.trim()) text += ` ${theme.fg("dim", preview.trim())}`;
+				else if (r.errorMessage) text += ` ${theme.fg("error", r.errorMessage)}`;
+				else text += ` ${theme.fg("muted", "(no output)")}`;
+			}
+			if (details.results.length > 5) {
+				text += `\n  ${theme.fg("muted", `... and ${details.results.length - 5} more results`)}`;
 			}
 
 			if (!isRunning) {
