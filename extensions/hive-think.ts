@@ -1022,6 +1022,8 @@ export default function (pi: ExtensionAPI) {
 			"Spawns independent pi processes with different models, all receiving the same full context.",
 			"All models run with --thinking xhigh and have read+bash tools for active investigation.",
 			"Use for architecture decisions, complex refactoring, technology choices, or multi-faceted problems.",
+			"",
+			"IMPORTANT: The result preview is collapsed for brevity. To read the full model outputs, use the hive_read tool (extract_answer=false) after hive_think completes.",
 		].join(" "),
 		parameters: HiveThinkParams,
 
@@ -1188,7 +1190,7 @@ export default function (pi: ExtensionAPI) {
 				const totalUsage = formatUsageStats(aggregateUsage(details.results));
 				if (totalUsage) text += `\n\n${theme.fg("dim", `Total: ${totalUsage}`)}`;
 			}
-			if (!expanded) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
+			if (!expanded) text += `\n${theme.fg("muted", "(Ctrl+O to expand · use hive_read for full output)")}`;
 
 			return new Text(text, 0, 0);
 		},

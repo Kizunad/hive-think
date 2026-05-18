@@ -47,12 +47,29 @@ interface HiveDetails {
 }
 
 function findLastHiveResult(messages: any[]): HiveDetails | null {
+	// Search messages bottom-up — check both top-level details and nested content blocks
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
-		if (msg.role !== "toolResult") continue;
-		const details = msg.details as HiveDetails | undefined;
-		if (details?.question && details?.models && details?.results) {
-			return details;
+		// Check top-level details (toolResult messages from built-in tools)
+		if (msg.details?.question && msg.details?.models && msg.details?.results) {
+			return msg.details as HiveDetails;
+		}
+		// Check content blocks (extension tool results embedded in assistant/user messages)
+		const content = msg.content;
+		if (Array.isArray(content)) {
+			for (const block of content) {
+				if (block?.details?.question && block?.details?.models && block?.details?.results) {
+					return block.details as HiveDetails;
+				}
+				// Check nested text content that might contain serialized details
+				if (block?.content && Array.isArray(block.content)) {
+					for (const inner of block.content) {
+						if (inner?.details?.question && inner?.details?.models && inner?.details?.results) {
+							return inner.details as HiveDetails;
+						}
+					}
+				}
+			}
 		}
 	}
 	return null;
@@ -141,7 +158,18 @@ export default function (pi: ExtensionAPI) {
 
 			const details = findLastHiveResult(messages);
 			if (!details) {
-				return { content: [{ type: "text", text: "No hive_think result found in current session. Try running hive_think first." }] };
+				// Show what we found for debugging
+				const counts = { total: messages.length, withDetails: 0, withContent: 0 };
+				for (const m of messages) {
+					if (m.details) counts.withDetails++;
+					if (Array.isArray(m.content)) counts.withContent++;
+				}
+				return {
+					content: [{
+						type: "text",
+						text: `No hive_think result found in current session. Messages: ${counts.total} total, ${counts.withDetails} with details, ${counts.withContent} with content array. Try running hive_think first, then hive_read in the same session.`,
+					}],
+				};
 			}
 
 			const allOutputs = modelOutputsFromDetails(details);
