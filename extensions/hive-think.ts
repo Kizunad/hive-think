@@ -996,14 +996,14 @@ export const HiveThinkParams = Type.Object({
 	models: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"Model names to use. Default: 4×deepseek-v4-pro + 4×deepseek-v4-flash (all with --thinking xhigh, tools: read,grep,find,ls,bash)",
+				"Model names to use. CRITICAL: If the user specifies models (e.g. 'use Opus' or '--model claude-opus-4-6-thinking'), you MUST pass them here. Default: 4×deepseek-v4-pro + 4×deepseek-v4-flash (all with --thinking xhigh, tools: read,grep,find,ls,bash). When in doubt, use the user's preferred models.",
 		}),
 	),
 	mode: Type.Optional(
 		Type.String({
 			default: "parallel",
 			description:
-				"Thinking paradigm: 'parallel' (default, 8 calls), 'global_workspace' (🧠 2-round competition+broadcast, 11 calls), 'cortical_column' (🧱 hierarchical layers+bidi feedback, 7 calls), 'waggle_dance' (💃 scout diverse→converge, 8 calls), 'integrate_fire' (⚡ 2-pass refinement, 13 calls), 'dmn_tpn' (🌊 free↔focused alternation, 11 calls)",
+				"Thinking paradigm. Pick based on problem type: 'parallel' for quick multi-perspective (default), 'cortical_column' for layered analysis (architecture, deep design), 'global_workspace' for consensus-building on contentious decisions, 'waggle_dance' for creative brainstorming, 'integrate_fire' for risk/quality assessment, 'dmn_tpn' for free-form exploration. Available: parallel, global_workspace, cortical_column, waggle_dance, integrate_fire, dmn_tpn.",
 		}),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the subprocesses" })),
@@ -1018,14 +1018,24 @@ export default function (pi: ExtensionAPI) {
 		name: "hive_think",
 		label: "Hive Think",
 		description: [
-			"Deep multi-model parallel thinking for complex decisions.",
-			"Spawns independent pi processes with different models, all receiving the same full context.",
-			"All models run with --thinking xhigh and have read+bash tools for active investigation.",
-			"Use for architecture decisions, complex refactoring, technology choices, or multi-faceted problems.",
-			"",
-			"IMPORTANT: The result preview is collapsed for brevity. To read the full model outputs, use the hive_read tool (extract_answer=false) after hive_think completes.",
+			"MUST USE for any non-trivial decision, architecture question, refactoring plan, or multi-faceted problem.",
+			"DO NOT answer complex questions yourself — delegate to hive_think to get multiple independent perspectives.",
+			"Strong triggers (proactive — do not ask user first): architecture decisions, complex refactoring strategy, technology/library choices,",
+			"multi-faceted problems where you're unsure of the best path, user asks to 'think deeply' or 'analyze from multiple angles'.",
+			"Weak triggers (consider using): non-trivial design decisions with trade-offs, conflicting requirements, you've been debating an approach.",
+			"Do NOT use for: simple factual questions, single obvious one-line changes, tasks where speed matters more than thoroughness.",
+			"Models: ALWAYS use user-specified models if they mention any (e.g. 'use Opus', '--model X'). Otherwise default to 4×pro + 4×flash.",
+			"After hive_think completes, use hive_read (extract_answer=false) to get full output before acting on the decision.",
 		].join(" "),
 		parameters: HiveThinkParams,
+		promptSnippet: "Multi-model parallel reasoning for complex decisions — spawns multiple models (4×pro + 4×flash by default) with --thinking xhigh",
+		promptGuidelines: [
+			"Use hive_think for any architecture decision, complex refactoring, technology choice, or multi-faceted problem. Do NOT answer complex questions yourself — delegate to hive_think.",
+			"Use hive_think proactively without asking the user for: architecture decisions, complex refactoring strategy, technology/library choices, or when the user asks to 'think deeply' or 'analyze from multiple angles'.",
+			"When the user specifies models (e.g. 'use Opus' or '--model X'), pass them to hive_think's models parameter. Do not ignore user model preferences.",
+			"Pick the hive_think mode based on problem type: 'cortical_column' for layered architecture analysis, 'global_workspace' for contentious decisions needing consensus, 'waggle_dance' for creative brainstorming, 'parallel' for quick multi-perspective (default).",
+			"After hive_think completes, use hive_read with extract_answer=false to get full model outputs before making the final decision.",
+		],
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const models: string[] = params.models && params.models.length > 0 ? params.models : DEFAULT_MODELS;
