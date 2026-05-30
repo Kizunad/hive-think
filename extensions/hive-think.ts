@@ -293,7 +293,7 @@ async function runModel(
 			taskParts.push("## Additional Context", context.trim());
 		}
 		taskParts.push("## Question", question);
-		args.push(taskParts.join("\n\n"));
+		const taskContent = taskParts.join("\n\n");
 
 		let wasAborted = false;
 
@@ -302,8 +302,13 @@ async function runModel(
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
 				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
+				stdio: ["pipe", "pipe", "pipe"],
 			});
+
+			// Write task content via stdin to avoid E2BIG (MAX_ARG_STRLEN=128KB)
+			proc.stdin.on("error", (_err) => { /* EPIPE if proc exits early, ignore */ });
+			proc.stdin.write(taskContent);
+			proc.stdin.end();
 			let buffer = "";
 			let resolved = false;
 
