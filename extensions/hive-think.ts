@@ -343,6 +343,24 @@ async function runModel(
 				stdio: ["pipe", "pipe", "pipe"],
 			});
 
+			// Terminate with escalation: SIGTERM, then SIGKILL after 5s only if the
+			// process truly hasn't exited. proc.killed only means a signal was *sent*,
+			// not that the process died — so track real exit via the "exit" event.
+			let procExited = false;
+			let killTimer: ReturnType<typeof setTimeout> | undefined;
+			proc.once("exit", () => {
+				procExited = true;
+				if (killTimer) clearTimeout(killTimer);
+			});
+			const terminate = () => {
+				proc.kill("SIGTERM");
+				if (!killTimer) {
+					killTimer = setTimeout(() => {
+						if (!procExited) proc.kill("SIGKILL");
+					}, 5000);
+				}
+			};
+
 			// Per-node hard timeout: kill a subprocess that never produces </ANSWER>
 			// and never exits, so one stuck node can't hang the whole hive.
 			let nodeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -355,10 +373,7 @@ async function runModel(
 			if (NODE_TIMEOUT_MS > 0) {
 				nodeTimer = setTimeout(() => {
 					nodeTimedOut = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
+					terminate();
 				}, NODE_TIMEOUT_MS);
 			}
 
@@ -404,7 +419,7 @@ async function runModel(
 							if (part.type === "text" && (part as any).text?.includes(ANSWER_END)) {
 								resolved = true;
 								clearNodeTimer();
-								proc.kill("SIGTERM");
+								terminate();
 								resolve(result.exitCode);
 								return;
 							}
@@ -443,10 +458,7 @@ async function runModel(
 				const killProc = () => {
 					wasAborted = true;
 					clearNodeTimer();
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
+					terminate();
 				};
 				if (signal.aborted) killProc();
 				else signal.addEventListener("abort", killProc, { once: true });
@@ -532,7 +544,10 @@ export function buildPartialOutput(
 	const collected = (lastDetails?.results ?? []).filter((r) => r.exitCode !== -1);
 	const completed = collected.filter((r) => r.exitCode === 0);
 	const minutes = Math.round(budgetMs / 60000);
-	const header = `${emoji} ${label} \u2014 \u23F1 hive budget (${minutes}min) reached; aborted remaining nodes. ${completed.length}/${models.length} nodes completed (partial result).`;
+	// Denominator is the actual node-result count (collected), not models.length \u2014
+	// multi-round modes (cortical_column, integrate_fire, \u2026) run far more nodes than
+	// there are models, so models.length would understate the work done.
+	const header = `${emoji} ${label} \u2014 \u23F1 hive budget (${minutes}min) reached; aborted remaining nodes. ${completed.length}/${collected.length} nodes completed (partial result).`;
 	const summaries = completed.map((r) => {
 		const out = getFinalOutput(r.messages);
 		const preview = out.slice(0, 200) + (out.length > 200 ? "..." : "");

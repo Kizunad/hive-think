@@ -488,7 +488,7 @@ function buildPartialOutput(mode, question, models, lastDetails, budgetMs) {
 	const collected = (lastDetails?.results ?? []).filter((r) => r.exitCode !== -1);
 	const completed = collected.filter((r) => r.exitCode === 0);
 	const minutes = Math.round(budgetMs / 60000);
-	const header = `${emoji} ${label} — ⏱ hive budget (${minutes}min) reached; aborted remaining nodes. ${completed.length}/${models.length} nodes completed (partial result).`;
+	const header = `${emoji} ${label} — ⏱ hive budget (${minutes}min) reached; aborted remaining nodes. ${completed.length}/${collected.length} nodes completed (partial result).`;
 	const summaries = completed.map((r) => {
 		const out = getFinalOutput(r.messages);
 		const preview = out.slice(0, 200) + (out.length > 200 ? "..." : "");
@@ -542,7 +542,7 @@ describe("buildPartialOutput", function () {
 			mk("c", -1, undefined),    // still running when budget fired
 		] };
 		const { output, details: out } = buildPartialOutput("parallel", "Q", ["a", "b", "c"], details, 45 * 60000);
-		assert.match(output, /1\/3 nodes completed/, "header should report 1/3 completed because only a finished");
+		assert.match(output, /1\/2 nodes completed/, "1 completed of 2 terminal nodes (running node excluded from denominator)");
 		assert.match(output, /45min/, "header should mention the 45min budget");
 		assert.match(output, /### a/, "completed node a should be listed");
 		assert.ok(!output.includes("### b"), "timed-out node b should not be listed as completed");
@@ -554,13 +554,13 @@ describe("buildPartialOutput", function () {
 			mk("a", 130, undefined), mk("b", -1, undefined),
 		] };
 		const { output } = buildPartialOutput("parallel", "Q", ["a", "b"], details, 45 * 60000);
-		assert.match(output, /0\/2 nodes completed/);
+		assert.match(output, /0\/1 nodes completed/);
 		assert.match(output, /proceed with your own analysis/, "must tell the agent to fall back, not hang/retry");
 	});
 
 	it("undefined lastDetails does not throw -> 0/N fallback", function () {
 		const { output } = buildPartialOutput("parallel", "Q", ["a"], undefined, 30 * 60000);
-		assert.match(output, /0\/1 nodes completed/);
+		assert.match(output, /0\/0 nodes completed/);
 		assert.match(output, /proceed with your own analysis/);
 	});
 

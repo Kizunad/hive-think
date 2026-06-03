@@ -188,7 +188,7 @@ spawn → monitor stdout (JSON lines) → detect </ANSWER> → SIGTERM → colle
 - **ANSWER early-exit**: The system prompt instructs models to wrap final output in `<ANSWER>...</ANSWER>`. When the orchestrator detects the closing tag, it kills the subprocess immediately — saving expensive thinking tokens that would otherwise be spent on post-recommendation rambling.
 - **Per-node timeout**: A node that never emits `</ANSWER>` and never exits is killed after `HIVE_NODE_TIMEOUT_MS` (default **30 min**; SIGTERM → 5s grace → SIGKILL). It becomes a failed result (non-zero exit) rather than hanging the hive — so one stuck DeepSeek subprocess can't block the others.
 - **Overall budget**: If the whole `hive_think` call exceeds `HIVE_BUDGET_MS` (default **45 min**), still-running nodes are aborted and whatever completed is returned as a **partial result**. The hive never hangs to the caller's outer timeout (e.g. a CI job limit) with zero output. If nothing finished, the result explicitly tells the agent to proceed on its own.
-- **Kill grace**: After any SIGTERM (early-exit, per-node timeout, budget abort, or external cancel), SIGKILL follows after 5s if the process hasn't exited.
+- **Kill grace**: After any SIGTERM (early-exit, per-node timeout, budget abort, or external cancel), SIGKILL after 5s if the process hasn't exited.
 - **Concurrency**: Maximum 4 subprocesses running at once (`mapWithConcurrencyLimit`), respecting API rate limits. Remaining models are queued.
 
 ### Timeout configuration
