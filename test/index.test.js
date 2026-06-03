@@ -465,3 +465,107 @@ describe("modelOutputsFromDetails", function () {
 		assert.equal(outputs[0].errorMessage, "timeout");
 	});
 });
+
+
+// ---------------------------------------------------------------------------
+// Inlined: resolvePositiveMs + buildPartialOutput (kept in sync with hive-think.ts)
+// ---------------------------------------------------------------------------
+
+function resolvePositiveMs(raw, fallback) {
+	if (raw === undefined || raw.trim() === "") return fallback;
+	const n = Number(raw);
+	return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+const TEST_MODE_META = {
+	parallel: { emoji: "\u{1F41D}", label: "Hive Think" },
+};
+
+function buildPartialOutput(mode, question, models, lastDetails, budgetMs) {
+	const meta = TEST_MODE_META[mode];
+	const emoji = meta?.emoji || "\u{1F41D}";
+	const label = meta?.label || mode;
+	const collected = (lastDetails?.results ?? []).filter((r) => r.exitCode !== -1);
+	const completed = collected.filter((r) => r.exitCode === 0);
+	const minutes = Math.round(budgetMs / 60000);
+	const header = `${emoji} ${label} — ⏱ hive budget (${minutes}min) reached; aborted remaining nodes. ${completed.length}/${collected.length} nodes completed (partial result).`;
+	const summaries = completed.map((r) => {
+		const out = getFinalOutput(r.messages);
+		const preview = out.slice(0, 200) + (out.length > 200 ? "..." : "");
+		return `### ${r.model} ✓\n${preview || "(no output)"}`;
+	});
+	const body =
+		summaries.length > 0
+			? summaries.join("\n\n")
+			: "(No node finished before the budget. Treat hive_think as unavailable and proceed with your own analysis — do not retry blindly.)";
+	return {
+		details: { question, models, mode, results: collected },
+		output: `${header}\n\n${body}`,
+	};
+}
+
+describe("resolvePositiveMs", function () {
+	it("undefined -> fallback", function () {
+		assert.equal(resolvePositiveMs(undefined, 1800000), 1800000);
+	});
+	it("empty / whitespace -> fallback", function () {
+		assert.equal(resolvePositiveMs("", 500), 500);
+		assert.equal(resolvePositiveMs("   ", 500), 500);
+	});
+	it("valid positive number string -> parsed (trim tolerated)", function () {
+		assert.equal(resolvePositiveMs("120000", 500), 120000);
+		assert.equal(resolvePositiveMs(" 90000 ", 500), 90000);
+	});
+	it("zero -> 0 (explicitly disables the timeout)", function () {
+		assert.equal(resolvePositiveMs("0", 500), 0);
+	});
+	it("negative -> fallback (invalid)", function () {
+		assert.equal(resolvePositiveMs("-5", 500), 500);
+	});
+	it("non-numeric -> fallback", function () {
+		assert.equal(resolvePositiveMs("abc", 500), 500);
+		assert.equal(resolvePositiveMs("12ms", 500), 500);
+	});
+});
+
+describe("buildPartialOutput", function () {
+	const mk = (model, exitCode, text) => ({
+		model, exitCode, durationMs: 0,
+		messages: text !== undefined ? [{ role: "assistant", content: [{ type: "text", text }] }] : [],
+		usage: {},
+	});
+
+	it("lists completed nodes, drops running, reports count + budget", function () {
+		const details = { question: "Q", models: ["a", "b", "c"], results: [
+			mk("a", 0, "alpha finding"),
+			mk("b", 124, undefined),   // node timeout
+			mk("c", -1, undefined),    // still running when budget fired
+		] };
+		const { output, details: out } = buildPartialOutput("parallel", "Q", ["a", "b", "c"], details, 45 * 60000);
+		assert.match(output, /1\/2 nodes completed/, "1 completed of 2 terminal nodes (running node excluded from denominator)");
+		assert.match(output, /45min/, "header should mention the 45min budget");
+		assert.match(output, /### a/, "completed node a should be listed");
+		assert.ok(!output.includes("### b"), "timed-out node b should not be listed as completed");
+		assert.equal(out.results.length, 2, "running node (-1) dropped; completed+failed kept (2)");
+	});
+
+	it("no completed nodes -> explicit proceed-on-your-own fallback (never empty)", function () {
+		const details = { question: "Q", models: ["a", "b"], results: [
+			mk("a", 130, undefined), mk("b", -1, undefined),
+		] };
+		const { output } = buildPartialOutput("parallel", "Q", ["a", "b"], details, 45 * 60000);
+		assert.match(output, /0\/1 nodes completed/);
+		assert.match(output, /proceed with your own analysis/, "must tell the agent to fall back, not hang/retry");
+	});
+
+	it("undefined lastDetails does not throw -> 0/N fallback", function () {
+		const { output } = buildPartialOutput("parallel", "Q", ["a"], undefined, 30 * 60000);
+		assert.match(output, /0\/0 nodes completed/);
+		assert.match(output, /proceed with your own analysis/);
+	});
+
+	it("unknown mode -> falls back to mode name (no crash on missing MODE_META)", function () {
+		const { output } = buildPartialOutput("mystery_mode", "Q", [], { results: [] }, 60000);
+		assert.match(output, /mystery_mode/);
+	});
+});

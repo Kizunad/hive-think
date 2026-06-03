@@ -48,6 +48,43 @@ export const ANSWER_END = "</ANSWER>";
 // Max concurrent pi subprocesses
 const MAX_CONCURRENCY = 4;
 
+// Per-node hard timeout: a deepseek subprocess that never emits </ANSWER> and
+// never exits is killed after this many ms (SIGTERM → 5s grace → SIGKILL), so one
+// stuck node can't hang the whole hive. 0 disables. Env: HIVE_NODE_TIMEOUT_MS.
+//
+// Overall budget: if the whole hive_think call exceeds this, still-running nodes are
+// aborted and whatever completed is returned as a partial result, so a stuck hive
+// never hangs to the outer (CI job) timeout with zero output. 0 disables.
+// Env: HIVE_BUDGET_MS.
+//
+// Invariant for callers: NODE_TIMEOUT_MS < HIVE_BUDGET_MS < outer job timeout, so a
+// single stuck node is killed first, the budget catches pathological/serial stacking,
+// and the job timeout never has to fire.
+export function resolvePositiveMs(raw: string | undefined, fallback: number): number {
+	if (raw === undefined || raw.trim() === "") return fallback;
+	const n = Number(raw);
+	return Number.isFinite(n) && n >= 0 ? n : fallback; // n === 0 disables
+}
+
+export const NODE_TIMEOUT_MS = resolvePositiveMs(process.env.HIVE_NODE_TIMEOUT_MS, 30 * 60_000); // 30 min
+export const HIVE_BUDGET_MS = resolvePositiveMs(process.env.HIVE_BUDGET_MS, 45 * 60_000); // 45 min
+
+// Merge AbortSignals into one that fires when any input fires (e.g. external job
+// cancel + the hive budget). Avoids depending on AbortSignal.any across runtimes.
+export function combineSignals(...signals: (AbortSignal | undefined)[]): AbortSignal {
+	const controller = new AbortController();
+	const onAbort = () => controller.abort();
+	for (const s of signals) {
+		if (!s) continue;
+		if (s.aborted) {
+			controller.abort();
+			break;
+		}
+		s.addEventListener("abort", onAbort, { once: true });
+	}
+	return controller.signal;
+}
+
 // ---------------------------------------------------------------------------
 // Mode metadata
 // ---------------------------------------------------------------------------
@@ -296,6 +333,7 @@ async function runModel(
 		const taskContent = taskParts.join("\n\n");
 
 		let wasAborted = false;
+		let nodeTimedOut = false;
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
@@ -304,6 +342,40 @@ async function runModel(
 				shell: false,
 				stdio: ["pipe", "pipe", "pipe"],
 			});
+
+			// Terminate with escalation: SIGTERM, then SIGKILL after 5s only if the
+			// process truly hasn't exited. proc.killed only means a signal was *sent*,
+			// not that the process died — so track real exit via the "exit" event.
+			let procExited = false;
+			let killTimer: ReturnType<typeof setTimeout> | undefined;
+			proc.once("exit", () => {
+				procExited = true;
+				if (killTimer) clearTimeout(killTimer);
+			});
+			const terminate = () => {
+				proc.kill("SIGTERM");
+				if (!killTimer) {
+					killTimer = setTimeout(() => {
+						if (!procExited) proc.kill("SIGKILL");
+					}, 5000);
+				}
+			};
+
+			// Per-node hard timeout: kill a subprocess that never produces </ANSWER>
+			// and never exits, so one stuck node can't hang the whole hive.
+			let nodeTimer: ReturnType<typeof setTimeout> | undefined;
+			const clearNodeTimer = () => {
+				if (nodeTimer) {
+					clearTimeout(nodeTimer);
+					nodeTimer = undefined;
+				}
+			};
+			if (NODE_TIMEOUT_MS > 0) {
+				nodeTimer = setTimeout(() => {
+					nodeTimedOut = true;
+					terminate();
+				}, NODE_TIMEOUT_MS);
+			}
 
 			// Write task content via stdin to avoid E2BIG (MAX_ARG_STRLEN=128KB)
 			proc.stdin.on("error", (_err) => { /* EPIPE if proc exits early, ignore */ });
@@ -346,7 +418,8 @@ async function runModel(
 						for (const part of msg.content) {
 							if (part.type === "text" && (part as any).text?.includes(ANSWER_END)) {
 								resolved = true;
-								proc.kill("SIGTERM");
+								clearNodeTimer();
+								terminate();
 								resolve(result.exitCode);
 								return;
 							}
@@ -372,18 +445,20 @@ async function runModel(
 
 			proc.on("close", (code) => {
 				if (buffer.trim()) processLine(buffer);
-				if (!resolved) resolve(code ?? 0);
+				clearNodeTimer();
+				if (!resolved) resolve(nodeTimedOut ? 124 : wasAborted ? 130 : (code ?? 0));
 			});
 
-			proc.on("error", () => { if (!resolved) resolve(1); });
+			proc.on("error", () => {
+				clearNodeTimer();
+				if (!resolved) resolve(1);
+			});
 
 			if (signal) {
 				const killProc = () => {
 					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
+					clearNodeTimer();
+					terminate();
 				};
 				if (signal.aborted) killProc();
 				else signal.addEventListener("abort", killProc, { once: true });
@@ -393,12 +468,20 @@ async function runModel(
 		result.exitCode = exitCode;
 		result.durationMs = Date.now() - startTime;
 
+		// A timed-out or aborted node is reported as a failed result (non-zero exit),
+		// NOT thrown: the hive keeps the perspectives that finished, and an external
+		// or budget abort degrades to a partial result instead of erroring out.
+		if (nodeTimedOut && result.exitCode !== 0 && !result.errorMessage) {
+			result.errorMessage = `node timeout after ${Math.round(NODE_TIMEOUT_MS / 1000)}s`;
+		} else if (wasAborted && result.exitCode !== 0 && !result.errorMessage) {
+			result.errorMessage = "aborted (hive budget or external signal)";
+		}
+
 		if (!result.errorMessage && result.stderr.trim()) {
 			const firstLine = result.stderr.trim().split("\n")[0].slice(0, 120);
 			result.errorMessage = `stderr: ${firstLine}`;
 		}
 
-		if (wasAborted) throw new Error("Hive think was aborted");
 		return result;
 	} finally {
 		if (tmpPromptPath)
@@ -442,6 +525,41 @@ function buildResult(
 	return {
 		details: { question, models, mode, results: allResults },
 		output: `${emoji} ${label} — ${successCount}/${allResults.length} calls in ${(totalDurationMs / 1000).toFixed(1)}s\n\n${finalText}`,
+	};
+}
+
+// Build a degraded result from whatever nodes completed before the overall budget
+// fired. Used when hive_think is aborted by HIVE_BUDGET_MS so the caller still gets
+// usable perspectives (or a clear "proceed on your own" signal) instead of an error.
+export function buildPartialOutput(
+	mode: string,
+	question: string,
+	models: string[],
+	lastDetails: HiveThinkDetails | undefined,
+	budgetMs: number,
+): { details: HiveThinkDetails; output: string } {
+	const meta = MODE_META[mode];
+	const emoji = meta?.emoji || "\u{1F41D}";
+	const label = meta?.label || mode;
+	const collected = (lastDetails?.results ?? []).filter((r) => r.exitCode !== -1);
+	const completed = collected.filter((r) => r.exitCode === 0);
+	const minutes = Math.round(budgetMs / 60000);
+	// Denominator is the actual node-result count (collected), not models.length \u2014
+	// multi-round modes (cortical_column, integrate_fire, \u2026) run far more nodes than
+	// there are models, so models.length would understate the work done.
+	const header = `${emoji} ${label} \u2014 \u23F1 hive budget (${minutes}min) reached; aborted remaining nodes. ${completed.length}/${collected.length} nodes completed (partial result).`;
+	const summaries = completed.map((r) => {
+		const out = getFinalOutput(r.messages);
+		const preview = out.slice(0, 200) + (out.length > 200 ? "..." : "");
+		return `### ${r.model} \u2713\n${preview || "(no output)"}`;
+	});
+	const body =
+		summaries.length > 0
+			? summaries.join("\n\n")
+			: "(No node finished before the budget. Treat hive_think as unavailable and proceed with your own analysis \u2014 do not retry blindly.)";
+	return {
+		details: { question, models, mode, results: collected },
+		output: `${header}\n\n${body}`,
 	};
 }
 
@@ -1065,8 +1183,33 @@ export default function (pi: ExtensionAPI) {
 			const executor = executors[mode];
 			if (!executor) throw new Error(`Mode "${mode}" not implemented yet.`);
 
-			const { details, output } = await executor(models, question, context, history, ctx.cwd, params.cwd, signal, onUpdate);
-			return { content: [{ type: "text", text: output }], details };
+			// Overall wall-clock budget: if the hive doesn't finish in time, abort the
+			// still-running nodes and return whatever completed, so a stuck hive never
+			// hangs to the outer (CI job) timeout. Per-node NODE_TIMEOUT_MS independently
+			// kills a single stuck subprocess inside runModel().
+			let budgetFired = false;
+			const budgetController = new AbortController();
+			const budgetTimer =
+				HIVE_BUDGET_MS > 0
+					? setTimeout(() => {
+							budgetFired = true;
+							budgetController.abort();
+						}, HIVE_BUDGET_MS)
+					: undefined;
+			const effectiveSignal = combineSignals(signal, budgetController.signal);
+
+			try {
+				const { details, output } = await executor(
+					models, question, context, history, ctx.cwd, params.cwd, effectiveSignal, onUpdate,
+				);
+				if (budgetFired) {
+					const partial = buildPartialOutput(mode, question, models, details, HIVE_BUDGET_MS);
+					return { content: [{ type: "text", text: partial.output }], details: partial.details };
+				}
+				return { content: [{ type: "text", text: output }], details };
+			} finally {
+				if (budgetTimer) clearTimeout(budgetTimer);
+			}
 		},
 
 		renderCall(args, theme, _context) {

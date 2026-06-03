@@ -186,8 +186,21 @@ spawn → monitor stdout (JSON lines) → detect </ANSWER> → SIGTERM → colle
 ```
 
 - **ANSWER early-exit**: The system prompt instructs models to wrap final output in `<ANSWER>...</ANSWER>`. When the orchestrator detects the closing tag, it kills the subprocess immediately — saving expensive thinking tokens that would otherwise be spent on post-recommendation rambling.
-- **Timeout**: If SIGTERM doesn't work within 5 seconds, SIGKILL is sent as fallback.
+- **Per-node timeout**: A node that never emits `</ANSWER>` and never exits is killed after `HIVE_NODE_TIMEOUT_MS` (default **30 min**; SIGTERM → 5s grace → SIGKILL). It becomes a failed result (non-zero exit) rather than hanging the hive — so one stuck DeepSeek subprocess can't block the others.
+- **Overall budget**: If the whole `hive_think` call exceeds `HIVE_BUDGET_MS` (default **45 min**), still-running nodes are aborted and whatever completed is returned as a **partial result**. The hive never hangs to the caller's outer timeout (e.g. a CI job limit) with zero output. If nothing finished, the result explicitly tells the agent to proceed on its own.
+- **Kill grace**: After any SIGTERM (early-exit, per-node timeout, budget abort, or external cancel), SIGKILL after 5s if the process hasn't exited.
 - **Concurrency**: Maximum 4 subprocesses running at once (`mapWithConcurrencyLimit`), respecting API rate limits. Remaining models are queued.
+
+### Timeout configuration
+
+Both timeouts are set via environment variables (read once at load). Set `0` to disable either.
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `HIVE_NODE_TIMEOUT_MS` | `1800000` (30 min) | Hard cap per node; kills a single stuck subprocess. |
+| `HIVE_BUDGET_MS` | `2700000` (45 min) | Hard cap for the whole hive; aborts remaining nodes and returns partial. |
+
+**Invariant**: keep `HIVE_NODE_TIMEOUT_MS < HIVE_BUDGET_MS < your outer (job) timeout`, so a single stuck node is killed first, the budget catches pathological/serial stacking (sequential modes like `cortical_column` run nodes one after another), and the outer timeout never has to fire. Example for a CI job with a 60-min limit: node 30 min / budget 45 min / job 60 min.
 
 ### Prompt cache strategy
 
@@ -199,8 +212,9 @@ All models share the same **DeepSeek** provider. The HIVE_SYSTEM_PROMPT (~2.5KB 
 |-----------|-----------------|
 | Model crash (non-zero exit) | `exitCode > 0`, `errorMessage` populated with last stderr line |
 | Missing ANSWER tag | Model terminated normally but output has no `<ANSWER>` block — use `hive_read({ extract_answer: false })` to inspect |
-| Subprocess timeout | SIGTERM → 5s grace → SIGKILL |
-| Aborted by user | Parent signal propagated to all child processes |
+| Per-node timeout | `exitCode 124`, `errorMessage: "node timeout after Ns"` — node killed, hive continues |
+| Overall budget reached | Remaining nodes aborted; `hive_think` returns a partial result listing the nodes that finished |
+| Aborted by user / budget | `exitCode 130`, `errorMessage: "aborted ..."`; parent signal propagated to all child processes |
 
 ---
 
@@ -257,7 +271,7 @@ The structured output format requires: Problem Restatement → Investigation →
 node --test test/index.test.js
 ```
 
-14 test suites covering: `formatTokens`, `formatUsageStats`, `getFinalOutput`, `mapWithConcurrencyLimit`, `DEFAULT_MODELS` validation, `ANSWER_END`, parameter validation, `extractAnswer`, `findLastHiveResult`, `modelOutputsFromDetails`.
+Test suites covering: `formatTokens`, `formatUsageStats`, `getFinalOutput`, `mapWithConcurrencyLimit`, `DEFAULT_MODELS` validation, `ANSWER_END`, parameter validation, `extractAnswer`, `findLastHiveResult`, `modelOutputsFromDetails`, `resolvePositiveMs` (timeout env parsing), `buildPartialOutput` (budget partial-result rendering).
 
 ---
 
