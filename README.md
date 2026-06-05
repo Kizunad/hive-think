@@ -1,8 +1,10 @@
 # 🐝 hive-think
 
-Deep multi-model parallel reasoning for [pi coding agent](https://pi.dev).
+Deep multi-model parallel reasoning and swarm bug hunting for [pi coding agent](https://pi.dev).
 
-Spawns **8 models in parallel** (4× **deepseek-v4-pro** + 4× **deepseek-v4-flash** by default), all with `--thinking xhigh` and read+bash tools. Each model receives the full conversation context and thinks independently. All responses are collected side-by-side for comparison.
+**hive_think**: Spawns **12 models in parallel** (4× deepseek-v4-pro + 4× deepseek-v4-flash + 4× sensenova-6.7-flash-lite by default), all with `--thinking xhigh` and read+bash tools. Each model receives the full conversation context and thinks independently. All responses are collected side-by-side for comparison.
+
+**swarm_review**: Spawns **15 cheap flash models** (sensenova-6.7-flash-lite, deepseek-v4-flash, minimax-m3, gemma-4-31b-it) in parallel for **bug/vulnerability hunting**, with consensus voting (≥80% threshold) and a pro-model jury for validation.
 
 **6 biologically-inspired thinking modes** — from simple parallel to multi-round consensus with bidirectional feedback. Ideal for architecture decisions, complex refactoring, technology choices, or any problem where multiple perspectives reduce blind spots.
 
@@ -14,7 +16,7 @@ Spawns **8 models in parallel** (4× **deepseek-v4-pro** + 4× **deepseek-v4-fla
 pi install git:github.com/Kizunad/hive-think
 ```
 
-The package registers 3 extensions (`hive-think`, `hive-read`, `hive-think-autopilot`) and a `/hive` slash command. The autopilot injects usage guidance into every system prompt so the model knows when to use `hive_think` proactively — no manual configuration needed.
+The package registers 4 extensions (`hive-think`, `hive-read`, `hive-think-autopilot`, `swarm-review`) and a `/hive` slash command. The autopilot injects usage guidance into every system prompt so the model knows when to use `hive_think` and `swarm_review` proactively — no manual configuration needed.
 
 ---
 
@@ -44,6 +46,75 @@ hive_read({ extract_answer: false, offset: 0, limit: 200 })  // full output, pag
 pi config
 # Disable "hive-think-autopilot" in the extensions panel
 ```
+
+---
+
+## 🪲 Swarm Review — Bug & Vulnerability Hunter
+
+Spawns **15 cheap flash models** in parallel (5× sensenova-6.7-flash-lite + 5× deepseek-v4-flash + 3× minimax-m3 + 2× gemma-4-31b-it) to scan code for bugs and vulnerabilities. Uses **consensus voting (≥80% threshold)** to filter false positives, then validates with a **pro-model jury** (3× deepseek-v4-pro).
+
+**Quantity over quality** — cheap models individually may hallucinate, but swarm consensus filters noise. Best for security audits, bug hunting, and pre-merge vulnerability checks.
+
+### Quick Start
+
+```typescript
+// Scan current directory for bugs
+swarm_review({})
+
+// Scan specific directory
+swarm_review({
+  targetDir: "./src",
+  excludePatterns: ["tests", "vendor"],
+  minVoteThreshold: 0.8
+})
+```
+
+### How it works
+
+```
+Phase 1: File inventory (~2s)
+  → find all source files in target directory
+
+Phase 2: Partition (~1s)
+  → split files into 15 groups, ≤180K chars each (2× overlap)
+
+Phase 3: Parallel scan (~3-8 min)
+  → 15 flash models scan in parallel (4 concurrent)
+  → each returns JSON array of findings
+
+Phase 4: Aggregate & vote (~10ms)
+  → deduplicate by 5-line bucket fingerprints
+  → cross-model voting: ≥12/15 models agree → passes
+
+Phase 5: Pro jury (~1-2 min)
+  → 3× deepseek-v4-pro vote UP/DOWN on each passed finding
+  → ≥2/3 UP → confirmed bug
+```
+
+### Output
+
+```
+🔴 `src/auth.ts:142` **critical** `sql-injection` — Raw SQL concat with user input (votes: 14/15, jury: 3/3 UP)
+🟠 `src/db.ts:89` **high** `sql-injection` — Unsanitized query parameter (votes: 13/15, jury: 3/3 UP)
+🟡 `src/api/handler.ts:301` **medium** `xss` — User input reflected without encoding (votes: 12/15, jury: 2/3 UP)
+
+---
+**Stats**: 247 files · 1,234,567 chars · 183 raw findings · 12 passed vote · **8 jury-approved** · 312s
+**Coverage**: 14/15 scan models · 3/3 jury models
+```
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `targetDir` | `string` | `cwd` | Directory to scan |
+| `excludePatterns` | `string[]` | `[]` | Additional dirs to exclude |
+| `minVoteThreshold` | `number` | `0.8` | Min vote fraction to pass (0.0-1.0) |
+| `filePatterns` | `string[]` | all | Glob patterns to filter files |
+
+### Cost
+
+sensenova-6.7-flash-lite is free via cliproxy Token Plan. deepseek-v4-flash is also free via cliproxy. Jury: deepseek-v4-pro ≈ $0.10-0.50 per `swarm_review` call (short jury prompts, no thinking overhead since jury prompt doesn't request reasoning).
 
 ---
 
@@ -259,7 +330,9 @@ The structured output format requires: Problem Restatement → Investigation →
 | Component | File | Description |
 |-----------|------|-------------|
 | Main extension | `extensions/hive-think.ts` | Registers `hive_think` tool, 6 mode executors, subprocess orchestration |
-| Autopilot | `extensions/hive-think-autopilot.ts` | Injects usage guidance into system prompt via `before_agent_start` hook |
+| Swarm review | `extensions/swarm-review.ts` | Registers `swarm_review` tool — 15-model bug/vulnerability hunter with voting |
+| Aggregation engine | `extensions/aggregation-engine.ts` | Pure TS functions for finding dedup, voting, and jury verdict analysis |
+| Autopilot | `extensions/hive-think-autopilot.ts` | Injects hive_think + swarm_review usage guidance into system prompt |
 | Result reader | `extensions/hive-read.ts` | Reads model outputs from session with ANSWER extraction + pagination |
 | Prompt template | `prompts/hive.md` | `/hive` slash command for manual invocation |
 

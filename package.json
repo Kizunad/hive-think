@@ -11,7 +11,11 @@
     "extensions": [
       "./extensions/hive-think.ts",
       "./extensions/hive-think-autopilot.ts",
-      "./extensions/hive-read.ts"
+      "./extensions/hive-read.ts",
+      "./extensions/swarm-review.ts",
+      "./extensions/hive-status.ts",
+      "./extensions/hive-abort.ts",
+      "./extensions/hive-list.ts"
     ],
     "prompts": ["./prompts"]
   },

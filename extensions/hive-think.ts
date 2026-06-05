@@ -25,21 +25,34 @@ import type { Message } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, getMarkdownTheme, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { backgroundManager } from "./background-manager.js";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-// Hive composition: 4 strong + 4 fast scouts = 8 models, all --thinking xhigh
+// Hive composition: 4 strong (shared cache) + 4 diverse flash scouts = 8 models
+// Uses provider-qualified IDs (provider/modelId) to resolve ambiguity where
+// a model ID exists in multiple providers (e.g. deepseek-v4-flash).
+// Override via the `models` parameter or HIVE_DEFAULT_MODELS env var.
 export const DEFAULT_MODELS = [
-	"deepseek-v4-pro",
-	"deepseek-v4-pro",
-	"deepseek-v4-pro",
-	"deepseek-v4-pro",
-	"deepseek-v4-flash",
-	"deepseek-v4-flash",
-	"deepseek-v4-flash",
-	"deepseek-v4-flash",
+	// === Strong tier: deepseek provider ===
+	"deepseek/deepseek-v4-pro",
+	"deepseek/deepseek-v4-pro",
+	"deepseek/deepseek-v4-pro",
+	"deepseek/deepseek-v4-pro",
+	// === Fast tier: cliproxy free flash ===
+	"cliproxy/deepseek-v4-flash",
+	"cliproxy/deepseek-v4-flash",
+	"cliproxy/deepseek-v4-flash",
+	"cliproxy/deepseek-v4-flash",
+	"cliproxy/sensenova-6.7-flash-lite",
+	"cliproxy/sensenova-6.7-flash-lite",
+	"cliproxy/sensenova-6.7-flash-lite",
+	"cliproxy/sensenova-6.7-flash-lite",
+	// === Extra ===
+	"ollama-cloud/minimax-m3",
+	"ollama-cloud/minimax-m3",
 ];
 
 const HIVE_TOOLS = "read,grep,find,ls,bash";
@@ -102,7 +115,7 @@ const MODE_META: Record<string, { emoji: string; label: string; description: str
 // System prompts
 // ---------------------------------------------------------------------------
 
-const HIVE_SYSTEM_PROMPT = `You are in HIVE THINK mode — a deep, multi-perspective analytical mode for complex software decisions.
+export const HIVE_SYSTEM_PROMPT = `You are in HIVE THINK mode — a deep, multi-perspective analytical mode for complex software decisions.
 
 You have access to read-only tools (read, grep, find, ls) and bash for verification/testing.
 ⚠️  DO NOT modify any code. No write, no edit. Read and test only.
@@ -282,7 +295,7 @@ interface HiveThinkDetails {
 // Model runner (core)
 // ---------------------------------------------------------------------------
 
-async function runModel(
+export async function runModel(
 	model: string,
 	question: string,
 	context: string,
@@ -491,7 +504,7 @@ async function runModel(
 	}
 }
 
-async function runModelWithTask(
+export async function runModelWithTask(
 	model: string,
 	task: string,
 	specificQuestion: string,
@@ -1130,6 +1143,13 @@ export const HiveThinkParams = Type.Object({
 		}),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the subprocesses" })),
+	async: Type.Optional(
+		Type.Boolean({
+			default: false,
+			description:
+				"Run in background (non-blocking). Returns sessionId immediately. Use hive_status to check progress, hive_read to get results. Default: false (synchronous, blocks until complete).",
+		}),
+	),
 });
 
 // ---------------------------------------------------------------------------
@@ -1165,10 +1185,35 @@ export default function (pi: ExtensionAPI) {
 			const question: string = params.question;
 			const context: string = params.context ?? "";
 			const mode: string = (params.mode as string) || "parallel";
+			const isAsync: boolean = (params["async"] as boolean) || false;
 
 			if (!MODE_META[mode]) {
 				throw new Error(`Unknown mode "${mode}". Available: ${Object.keys(MODE_META).join(", ")}`);
 			}
+
+			// ── Background (non-blocking) path ──
+			if (isAsync) {
+				backgroundManager.init(pi);
+				const history = buildHistory(ctx.messages ?? []);
+				const sessionId = backgroundManager.launchHive({
+					question: `[${mode}] ${question}`,
+					context,
+					history,
+					models,
+					mode,
+					cwd: (params.cwd as string) ?? ctx.cwd,
+				});
+
+				return {
+					content: [{
+						type: "text",
+						text: `🐝 Background hive_think launched: \`${sessionId}\`\n- Mode: ${mode}\n- Models: ${models.length}\n- Question: ${question.slice(0, 100)}${question.length > 100 ? "..." : ""}\n\nUse \`hive_status({ sessionId: "${sessionId}" })\` to check progress.\nUse \`hive_read({ sessionId: "${sessionId}" })\` to read results when complete.\nUse \`hive_list()\` to list all background hives.`,
+					}],
+					details: { sessionId, question, models, mode, status: "launched", async: true },
+				};
+			}
+
+			// ── Synchronous path (existing behavior, unchanged) ──
 
 			const history = buildHistory(ctx.messages ?? []);
 
@@ -1215,6 +1260,7 @@ export default function (pi: ExtensionAPI) {
 		renderCall(args, theme, _context) {
 			const models: string[] = (args.models as string[]) ?? DEFAULT_MODELS;
 			const mode: string = (args.mode as string) || "parallel";
+			const isAsync = (args["async"] as boolean) || false;
 			const emoji = MODE_META[mode]?.emoji || "🐝";
 			const question = (args.question as string) || "...";
 			const preview = question.length > 80 ? `${question.slice(0, 80)}...` : question;
@@ -1224,10 +1270,12 @@ export default function (pi: ExtensionAPI) {
 					? models.join(", ")
 					: `${models.slice(0, 3).join(", ")} +${models.length - 3} more`;
 
+			const asyncTag = isAsync ? ` ${theme.fg("warning", "⏳ background")}` : "";
 			let text =
 				theme.fg("toolTitle", theme.bold("hive_think ")) +
 				theme.fg("accent", `${emoji} ${models.length} models`) +
 				theme.fg("muted", ` [${mode} · xhigh · read,bash]`) +
+				asyncTag +
 				`\n  ${theme.fg("dim", modelSummary)}`;
 			text += `\n  ${theme.fg("dim", preview)}`;
 
