@@ -72,6 +72,12 @@ const DEFAULT_MODELS = [
 
 const ANSWER_END = "</ANSWER>";
 
+const THINKING_LEVELS = ["low", "medium", "high", "xhigh"];
+
+function resolveThinking(value, fallback = "xhigh") {
+	return typeof value === "string" && THINKING_LEVELS.includes(value) ? value : fallback;
+}
+
 // ---------------------------------------------------------------------------
 // Param validation (mirrors TypeBox schema: question=String required, others optional)
 // ---------------------------------------------------------------------------
@@ -94,6 +100,11 @@ function validateParams(params) {
 			errors.push("models must be an array if provided");
 		} else if (p.models.some(function (m) { return typeof m !== "string"; })) {
 			errors.push("models must contain only strings");
+		}
+	}
+	if (p.thinking !== undefined && p.thinking !== null) {
+		if (typeof p.thinking !== "string" || !THINKING_LEVELS.includes(p.thinking)) {
+			errors.push("thinking must be one of low|medium|high|xhigh if provided");
 		}
 	}
 	if (p.cwd !== undefined && p.cwd !== null && typeof p.cwd !== "string") {
@@ -318,6 +329,55 @@ describe("Param validation", function () {
 
 	it("rejects non-string cwd", function () {
 		assert.equal(validateParams({ question: "test", cwd: 123 }).valid, false);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// thinking-level helpers (inlined from extensions/hive-think.ts)
+// ---------------------------------------------------------------------------
+
+describe("resolveThinking", function () {
+	it("passes through each valid level", function () {
+		for (const lvl of THINKING_LEVELS) {
+			assert.equal(resolveThinking(lvl), lvl, lvl + " should pass through");
+		}
+	});
+
+	it("defaults to xhigh when missing", function () {
+		assert.equal(resolveThinking(undefined), "xhigh");
+		assert.equal(resolveThinking(null), "xhigh");
+	});
+
+	it("honors a custom fallback", function () {
+		assert.equal(resolveThinking(undefined, "low"), "low");
+		assert.equal(resolveThinking("", "low"), "low");
+	});
+
+	it("rejects out-of-set values → fallback", function () {
+		assert.equal(resolveThinking("ultra"), "xhigh");
+		assert.equal(resolveThinking("HIGH"), "xhigh", "case-sensitive: HIGH is not a level");
+		assert.equal(resolveThinking(5), "xhigh");
+		assert.equal(resolveThinking("medium ", "low"), "low", "whitespace not trimmed → fallback");
+	});
+});
+
+describe("hive_think param validation — thinking", function () {
+	it("accepts each valid thinking level", function () {
+		for (const lvl of THINKING_LEVELS) {
+			assert.ok(validateParams({ question: "q", thinking: lvl }).valid, lvl + " should be accepted");
+		}
+	});
+
+	it("rejects an unknown thinking level", function () {
+		assert.equal(validateParams({ question: "q", thinking: "ultra" }).valid, false);
+	});
+
+	it("rejects a non-string thinking value", function () {
+		assert.equal(validateParams({ question: "q", thinking: 3 }).valid, false);
+	});
+
+	it("still accepts question-only (thinking optional)", function () {
+		assert.ok(validateParams({ question: "q" }).valid);
 	});
 });
 
