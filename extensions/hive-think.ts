@@ -58,6 +58,16 @@ export const DEFAULT_MODELS = [
 const HIVE_TOOLS = "read,grep,find,ls,bash";
 export const ANSWER_END = "</ANSWER>";
 
+// Valid --thinking levels. A caller-supplied value outside this set falls back to the default.
+export const THINKING_LEVELS = ["low", "medium", "high", "xhigh"] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+
+export function resolveThinking(value: unknown, fallback: ThinkingLevel = "xhigh"): ThinkingLevel {
+	return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value)
+		? (value as ThinkingLevel)
+		: fallback;
+}
+
 // Max concurrent pi subprocesses
 const MAX_CONCURRENCY = 4;
 
@@ -304,13 +314,14 @@ export async function runModel(
 	cwd: string | undefined,
 	signal: AbortSignal | undefined,
 	customSystemPrompt?: string,
+	thinking: ThinkingLevel = "xhigh",
 ): Promise<ModelResult> {
 	const args: string[] = [
 		"--mode", "json",
 		"-p",
 		"--no-session",
 		"--model", model,
-		"--thinking", "xhigh",
+		"--thinking", thinking,
 		"--tools", HIVE_TOOLS,
 	];
 
@@ -630,6 +641,7 @@ async function executeParallel(
 	paramsCwd: string | undefined,
 	signal: AbortSignal | undefined,
 	onUpdate: ((update: any) => void) | undefined,
+	thinking: ThinkingLevel = "xhigh",
 ): Promise<{ details: HiveThinkDetails; output: string }> {
 	const allResults: ModelResult[] = new Array(models.length);
 	for (let i = 0; i < models.length; i++) {
@@ -653,7 +665,7 @@ async function executeParallel(
 	emitUpdate();
 
 	const results = await mapWithConcurrencyLimit(models, MAX_CONCURRENCY, async (model, index) => {
-		const result = await runModel(model, question, context, history, cwd, paramsCwd, signal);
+		const result = await runModel(model, question, context, history, cwd, paramsCwd, signal, undefined, thinking);
 		allResults[index] = result;
 		emitUpdate();
 		return result;
@@ -1142,6 +1154,12 @@ export const HiveThinkParams = Type.Object({
 				"Thinking paradigm. Pick based on problem type: 'parallel' for quick multi-perspective (default), 'cortical_column' for layered analysis (architecture, deep design), 'global_workspace' for consensus-building on contentious decisions, 'waggle_dance' for creative brainstorming, 'integrate_fire' for risk/quality assessment, 'dmn_tpn' for free-form exploration. Available: parallel, global_workspace, cortical_column, waggle_dance, integrate_fire, dmn_tpn.",
 		}),
 	),
+	thinking: Type.Optional(
+		Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("xhigh")], {
+			description:
+				"Reasoning depth for every model. Default: xhigh. Lower it (e.g. 'low') for cheaper/faster passes — useful when delegating shallow material-gathering. Currently applied in 'parallel' mode.",
+		}),
+	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the subprocesses" })),
 	async: Type.Optional(
 		Type.Boolean({
@@ -1185,6 +1203,7 @@ export default function (pi: ExtensionAPI) {
 			const question: string = params.question;
 			const context: string = params.context ?? "";
 			const mode: string = (params.mode as string) || "parallel";
+			const thinking = resolveThinking(params.thinking);
 			const isAsync: boolean = (params["async"] as boolean) || false;
 
 			if (!MODE_META[mode]) {
@@ -1245,7 +1264,7 @@ export default function (pi: ExtensionAPI) {
 
 			try {
 				const { details, output } = await executor(
-					models, question, context, history, ctx.cwd, params.cwd, effectiveSignal, onUpdate,
+					models, question, context, history, ctx.cwd, params.cwd, effectiveSignal, onUpdate, thinking,
 				);
 				if (budgetFired) {
 					const partial = buildPartialOutput(mode, question, models, details, HIVE_BUDGET_MS);
