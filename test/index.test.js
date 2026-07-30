@@ -1,631 +1,854 @@
 /**
- * Tests for hive-think extension
- * Run: node --test test/index.test.js
+ * Tests for hive-think.
+ * Run: node --test test/index.test.js   (Node >= 22.18 strips TS types natively)
  *
- * Pure helper functions inlined from extensions/hive-think.ts
- * to avoid pi runtime dependency. Keep in sync when helpers change.
+ * These import the real modules. The previous suite kept hand-copied duplicates of
+ * every helper and asserted against the copies, so its DEFAULT_MODELS assertions
+ * stayed green for months while the source drifted to a different list entirely.
+ * Anything pure enough to test lives in hive-util.ts, hive-config.ts, or
+ * aggregation-engine.ts precisely so it can be imported here rather than mirrored.
  */
 
 import { describe, it } from "node:test";
 import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
-// ---------------------------------------------------------------------------
-// Inlined helpers from index.ts (kept in sync manually)
-// ---------------------------------------------------------------------------
+import {
+	ANSWER_END,
+	ANSWER_START,
+	Semaphore,
+	combineSignals,
+	extractAnswer,
+	extractAnswerBlock,
+	formatTokens,
+	formatUsageStats,
+	mapWithConcurrencyLimit,
+	resolvePositiveMs,
+} from "../extensions/hive-util.ts";
 
-function formatTokens(count) {
-	if (count < 1000) return count.toString();
-	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-	if (count < 1000000) return `${Math.round(count / 1000)}k`;
-	return `${(count / 1000000).toFixed(1)}M`;
-}
+import {
+	DEFAULT_THINKING,
+	DEFAULT_THRESHOLD_PCT,
+	NODES_CEILING,
+	NODES_FLOOR,
+	configSearchPaths,
+	loadConfig,
+	parseConfig,
+	unconfiguredError,
+} from "../extensions/hive-config.ts";
 
-function formatUsageStats(usage) {
-	const parts = [];
-	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
-	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
-	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
-	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
-	if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
-	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
-	if (usage.contextTokens && usage.contextTokens > 0) parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
-	return parts.join(" ");
-}
+import {
+	MIN_VOTERS,
+	decideNodeCount,
+	drawNodes,
+	extractJsonValue,
+	formatVoteLine,
+	independentSolutions,
+	mergePropositions,
+	minVotesFor,
+	normalizeSlug,
+	parseBallots,
+	parsePropositions,
+	parseSolutions,
+	tallyBallots,
+	tallyItem,
+	tallyMutexGroups,
+} from "../extensions/aggregation-engine.ts";
 
-function getFinalOutput(messages) {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
-			}
-			if (msg.errorMessage) return `[Error: ${msg.errorMessage}]`;
-		}
-	}
-	return "";
-}
+// ===========================================================================
+// hive-util
+// ===========================================================================
 
-async function mapWithConcurrencyLimit(items, concurrency, fn) {
-	if (items.length === 0) return [];
-	const limit = Math.max(1, Math.min(concurrency, items.length));
-	const results = new Array(items.length);
-	let nextIndex = 0;
-	const workers = new Array(limit).fill(null).map(async () => {
-		while (true) {
-			const current = nextIndex++;
-			if (current >= items.length) return;
-			results[current] = await fn(items[current], current);
-		}
-	});
-	await Promise.all(workers);
-	return results;
-}
-
-// ---------------------------------------------------------------------------
-// Constants (verified against index.ts source)
-// ---------------------------------------------------------------------------
-
-const DEFAULT_MODELS = [
-	"deepseek-v4-pro", "deepseek-v4-pro", "deepseek-v4-pro", "deepseek-v4-pro",
-	"deepseek-v4-flash", "deepseek-v4-flash", "deepseek-v4-flash", "deepseek-v4-flash",
-];
-
-const ANSWER_END = "</ANSWER>";
-
-const THINKING_LEVELS = ["low", "medium", "high", "xhigh"];
-
-function resolveThinking(value, fallback = "xhigh") {
-	return typeof value === "string" && THINKING_LEVELS.includes(value) ? value : fallback;
-}
-
-// ---------------------------------------------------------------------------
-// Param validation (mirrors TypeBox schema: question=String required, others optional)
-// ---------------------------------------------------------------------------
-
-function validateParams(params) {
-	const errors = [];
-	if (!params || typeof params !== "object") {
-		return { valid: false, errors: ["params must be an object"] };
-	}
-	const p = params;
-
-	if (typeof p.question !== "string" || p.question.length === 0) {
-		errors.push("question must be a non-empty string");
-	}
-	if (p.context !== undefined && p.context !== null && typeof p.context !== "string") {
-		errors.push("context must be a string if provided");
-	}
-	if (p.models !== undefined && p.models !== null) {
-		if (!Array.isArray(p.models)) {
-			errors.push("models must be an array if provided");
-		} else if (p.models.some(function (m) { return typeof m !== "string"; })) {
-			errors.push("models must contain only strings");
-		}
-	}
-	if (p.thinking !== undefined && p.thinking !== null) {
-		if (typeof p.thinking !== "string" || !THINKING_LEVELS.includes(p.thinking)) {
-			errors.push("thinking must be one of low|medium|high|xhigh if provided");
-		}
-	}
-	if (p.cwd !== undefined && p.cwd !== null && typeof p.cwd !== "string") {
-		errors.push("cwd must be a string if provided");
-	}
-
-	return { valid: errors.length === 0, errors };
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-describe("formatTokens", function () {
-	it("raw number for values under 1000", function () {
+describe("formatTokens", () => {
+	it("passes through counts under 1k", () => {
 		assert.equal(formatTokens(0), "0");
-		assert.equal(formatTokens(1), "1");
 		assert.equal(formatTokens(999), "999");
 	});
-	it("1.0k–9.9k range", function () {
-		assert.equal(formatTokens(1000), "1.0k");
+
+	it("uses one decimal under 10k and rounds above", () => {
 		assert.equal(formatTokens(1500), "1.5k");
-		assert.equal(formatTokens(9999), "10.0k");
+		assert.equal(formatTokens(12_400), "12k");
 	});
-	it("10k–999k range (rounded)", function () {
-		assert.equal(formatTokens(10000), "10k");
-		assert.equal(formatTokens(12345), "12k");
-		assert.equal(formatTokens(999999), "1000k");
-	});
-	it("1M+ range", function () {
-		assert.equal(formatTokens(1000000), "1.0M");
-		assert.equal(formatTokens(1500000), "1.5M");
-		assert.equal(formatTokens(10000000), "10.0M");
+
+	it("switches to M at a million", () => {
+		assert.equal(formatTokens(2_500_000), "2.5M");
 	});
 });
 
-describe("formatUsageStats", function () {
-	it("complete stats with all fields populated", function () {
-		const r = formatUsageStats({
-			input: 50000, output: 2000, cacheRead: 12000, cacheWrite: 3000,
-			cost: 0.1234, contextTokens: 64000, turns: 3,
-		});
-		assert.ok(r.includes("3 turns"));
-		assert.ok(r.includes("↑50k"));
-		assert.ok(r.includes("↓2.0k"));
-		assert.ok(r.includes("R12k"));
-		assert.ok(r.includes("W3.0k"));
-		assert.ok(r.includes("$0.1234"));
-		assert.ok(r.includes("ctx:64k"));
+describe("formatUsageStats", () => {
+	it("omits zero fields entirely", () => {
+		assert.equal(formatUsageStats({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }), "");
 	});
 
-	it("single turn (no plural)", function () {
-		const r = formatUsageStats({
-			input: 1000, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1,
+	it("renders the fields that are present", () => {
+		const out = formatUsageStats({
+			input: 1200,
+			output: 340,
+			cacheRead: 5000,
+			cacheWrite: 0,
+			cost: 0.0123,
+			turns: 2,
+			contextTokens: 8000,
 		});
-		assert.ok(r.includes("1 turn"));
-		assert.ok(!r.includes("turns"));
-	});
-
-	it("omits zero-value fields", function () {
-		const r = formatUsageStats({
-			input: 0, output: 100, cacheRead: 0, cacheWrite: 0, cost: 0,
-		});
-		assert.ok(!r.includes("↑"));
-		assert.ok(r.includes("↓100"));
-	});
-
-	it("omits ctx when contextTokens is 0 or missing", function () {
-		assert.ok(!formatUsageStats({ input: 1, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0 }).includes("ctx:"));
-		assert.ok(!formatUsageStats({ input: 1, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }).includes("ctx:"));
+		assert.equal(out, "2 turns ↑1.2k ↓340 R5.0k $0.0123 ctx:8.0k");
 	});
 });
 
-describe("getFinalOutput", function () {
-	it("last assistant text wins", function () {
-		const msgs = [
-			{ role: "user", content: [{ type: "text", text: "hello" }] },
-			{ role: "assistant", content: [{ type: "text", text: "1st" }] },
-			{ role: "assistant", content: [{ type: "text", text: "final" }] },
-		];
-		assert.equal(getFinalOutput(msgs), "final");
+describe("resolvePositiveMs", () => {
+	it("falls back on undefined, blank, and junk", () => {
+		assert.equal(resolvePositiveMs(undefined, 42), 42);
+		assert.equal(resolvePositiveMs("   ", 42), 42);
+		assert.equal(resolvePositiveMs("abc", 42), 42);
+		assert.equal(resolvePositiveMs("-1", 42), 42);
 	});
 
-	it("skips non-assistant roles", function () {
-		const msgs = [
-			{ role: "user", content: [{ type: "text", text: "q" }] },
-			{ role: "toolResult", content: [{ type: "text", text: "tool" }] },
-			{ role: "assistant", content: [{ type: "text", text: "answer" }] },
-		];
-		assert.equal(getFinalOutput(msgs), "answer");
+	it("treats 0 as an explicit disable rather than a fallback", () => {
+		assert.equal(resolvePositiveMs("0", 42), 0);
 	});
 
-	it("empty array", function () {
-		assert.equal(getFinalOutput([]), "");
-	});
-
-	it("errorMessage fallback", function () {
-		const msgs = [{ role: "assistant", content: [], errorMessage: "timeout" }];
-		assert.equal(getFinalOutput(msgs), "[Error: timeout]");
-	});
-
-	it("no assistant → empty", function () {
-		const msgs = [{ role: "user", content: [{ type: "text", text: "hi" }] }];
-		assert.equal(getFinalOutput(msgs), "");
-	});
-
-	it("error in last assistant overrides prior text", function () {
-		const msgs = [
-			{ role: "assistant", content: [{ type: "text", text: "ok" }] },
-			{ role: "assistant", content: [], errorMessage: "rate limited" },
-		];
-		assert.equal(getFinalOutput(msgs), "[Error: rate limited]");
+	it("accepts a positive value", () => {
+		assert.equal(resolvePositiveMs("60000", 42), 60_000);
 	});
 });
 
-describe("mapWithConcurrencyLimit", function () {
-	it("preserves order", async function () {
-		const r = await mapWithConcurrencyLimit([10, 20, 30], 2, async function (n, i) { return n * (i + 1); });
-		assert.deepEqual(r, [10, 40, 90]);
+describe("extractAnswerBlock", () => {
+	it("returns null when there is no tag", () => {
+		assert.equal(extractAnswerBlock("just prose"), null);
+		assert.equal(extractAnswerBlock(""), null);
 	});
 
-	it("empty input → empty output", async function () {
-		const r = await mapWithConcurrencyLimit([], 2, async function (n) { return n; });
-		assert.deepEqual(r, []);
+	it("extracts and trims a well-formed block", () => {
+		assert.equal(extractAnswerBlock(`before ${ANSWER_START}\n  hello \n${ANSWER_END} after`), "hello");
 	});
 
-	it("respects concurrency limit", async function () {
-		const active = new Set();
-		let maxSeen = 0;
-		await mapWithConcurrencyLimit([1, 2, 3, 4, 5], 2, async function (n) {
-			active.add(n);
-			maxSeen = Math.max(maxSeen, active.size);
-			await new Promise(function (r2) { setTimeout(r2, 20); });
-			active.delete(n);
-			return n * 2;
-		});
-		assert.equal(maxSeen, 2);
+	it("returns the tail of an unterminated block", () => {
+		// The ANSWER early-exit kills the subprocess, which can cut the stream mid-tag.
+		assert.equal(extractAnswerBlock(`x ${ANSWER_START} partial output`), "partial output");
 	});
 
-	it("clamps concurrency to item count", async function () {
-		let maxSeen = 0;
-		const active = new Set();
-		await mapWithConcurrencyLimit([1, 2], 100, async function (n) {
-			active.add(n);
-			maxSeen = Math.max(maxSeen, active.size);
-			await new Promise(function (r2) { setTimeout(r2, 10); });
-			active.delete(n);
-			return n;
-		});
-		assert.ok(maxSeen <= 2);
+	it("takes the last complete block when several are emitted", () => {
+		const text = `${ANSWER_START}first${ANSWER_END} noise ${ANSWER_START}second${ANSWER_END}`;
+		assert.equal(extractAnswerBlock(text), "second");
+	});
+
+	it("prefers a complete block over a later unterminated one", () => {
+		// Anchoring on lastIndexOf for each tag independently would put the opener
+		// after the closer here and slice backwards to "". Preferring the complete
+		// block is also the safer choice: a fragment may be truncated mid-JSON.
+		const text = `${ANSWER_START}complete${ANSWER_END} then ${ANSWER_START}started`;
+		const got = extractAnswerBlock(text);
+		assert.notEqual(got, "");
+		assert.equal(got, "complete");
 	});
 });
 
-describe("DEFAULT_MODELS", function () {
-	it("exactly 8 models", function () {
-		assert.equal(DEFAULT_MODELS.length, 8);
+describe("extractAnswer", () => {
+	it("falls back to the whole text so untagged JSON is still parseable", () => {
+		assert.equal(extractAnswer('[{"slug":"a"}]'), '[{"slug":"a"}]');
 	});
 
-	it("4 deepseek-v4-pro + 4 deepseek-v4-flash", function () {
-		const pro = DEFAULT_MODELS.filter(function (m) { return m === "deepseek-v4-pro"; });
-		const flash = DEFAULT_MODELS.filter(function (m) { return m === "deepseek-v4-flash"; });
-		assert.equal(pro.length, 4);
-		assert.equal(flash.length, 4);
+	it("prefers the tagged block when present", () => {
+		assert.equal(extractAnswer(`noise ${ANSWER_START}kept${ANSWER_END}`), "kept");
+	});
+});
+
+describe("mapWithConcurrencyLimit", () => {
+	it("returns results in input order regardless of completion order", async () => {
+		const out = await mapWithConcurrencyLimit([30, 10, 20], 3, async (ms, i) => {
+			await new Promise((r) => setTimeout(r, ms));
+			return `${i}:${ms}`;
+		});
+		assert.deepEqual(out, ["0:30", "1:10", "2:20"]);
 	});
 
-	it("no gpt/gemini/gemma", function () {
-		for (const m of DEFAULT_MODELS) {
-			assert.ok(!m.includes("gpt"), m + " contains gpt");
-			assert.ok(!m.includes("gemini"), m + " contains gemini");
-			assert.ok(!m.includes("gemma"), m + " contains gemma");
+	it("never exceeds the limit", async () => {
+		let active = 0;
+		let peak = 0;
+		await mapWithConcurrencyLimit([...Array(10).keys()], 3, async () => {
+			active++;
+			peak = Math.max(peak, active);
+			await new Promise((r) => setTimeout(r, 5));
+			active--;
+		});
+		assert.ok(peak <= 3, `peak concurrency ${peak} exceeded limit 3`);
+	});
+
+	it("handles an empty list and a limit above the item count", async () => {
+		assert.deepEqual(await mapWithConcurrencyLimit([], 4, async () => 1), []);
+		assert.deepEqual(await mapWithConcurrencyLimit([1, 2], 99, async (n) => n * 2), [2, 4]);
+	});
+});
+
+describe("Semaphore", () => {
+	it("never lets more than `limit` holders in at once", async () => {
+		const sem = new Semaphore(2);
+		let peak = 0;
+		await Promise.all(
+			[...Array(8).keys()].map(async () => {
+				const release = await sem.acquire();
+				peak = Math.max(peak, sem.inUse);
+				await new Promise((r) => setTimeout(r, 5));
+				release();
+			}),
+		);
+		assert.equal(peak, 2);
+		assert.equal(sem.inUse, 0);
+	});
+
+	it("hands a released slot to the waiter instead of double-counting it", async () => {
+		// Releasing by decrementing first would let a fresh acquire take the fast path
+		// while the woken waiter also increments, putting two holders in one slot.
+		const sem = new Semaphore(1);
+		const first = await sem.acquire();
+		let secondEntered = false;
+		const second = sem.acquire().then((release) => {
+			secondEntered = true;
+			assert.equal(sem.inUse, 1);
+			return release;
+		});
+		assert.equal(secondEntered, false);
+		first();
+		(await second)();
+		assert.equal(sem.inUse, 0);
+	});
+
+	it("ignores a double release", async () => {
+		const sem = new Semaphore(1);
+		const release = await sem.acquire();
+		release();
+		release();
+		assert.equal(sem.inUse, 0);
+	});
+
+	it("serves waiters first-in-first-out", async () => {
+		const sem = new Semaphore(1);
+		const held = await sem.acquire();
+		const order = [];
+		const waiters = [1, 2, 3].map((n) =>
+			sem.acquire().then((release) => {
+				order.push(n);
+				release();
+			}),
+		);
+		held();
+		await Promise.all(waiters);
+		assert.deepEqual(order, [1, 2, 3]);
+	});
+});
+
+describe("combineSignals", () => {
+	it("fires when any input fires", () => {
+		const a = new AbortController();
+		const b = new AbortController();
+		const merged = combineSignals(a.signal, b.signal, undefined);
+		assert.equal(merged.aborted, false);
+		b.abort();
+		assert.equal(merged.aborted, true);
+	});
+
+	it("is already aborted when an input was", () => {
+		const a = new AbortController();
+		a.abort();
+		assert.equal(combineSignals(a.signal).aborted, true);
+	});
+
+	it("tolerates being given nothing", () => {
+		assert.equal(combineSignals(undefined, undefined).aborted, false);
+	});
+});
+
+// ===========================================================================
+// hive-config
+// ===========================================================================
+
+describe("configSearchPaths", () => {
+	it("puts the project-local file first so a repo can pin a roster", () => {
+		const paths = configSearchPaths("/work/proj", {}, "/home/u");
+		assert.equal(paths[0], path.join("/work/proj", ".hive-think.json"));
+		assert.equal(paths[1], path.join("/home/u", ".config", "pi", "hive-think.json"));
+	});
+
+	it("honours XDG_CONFIG_HOME", () => {
+		const paths = configSearchPaths("/work", { XDG_CONFIG_HOME: "/xdg" }, "/home/u");
+		assert.equal(paths[1], path.join("/xdg", "pi", "hive-think.json"));
+	});
+
+	it("ignores a blank XDG_CONFIG_HOME", () => {
+		const paths = configSearchPaths("/work", { XDG_CONFIG_HOME: "  " }, "/home/u");
+		assert.equal(paths[1], path.join("/home/u", ".config", "pi", "hive-think.json"));
+	});
+});
+
+describe("parseConfig", () => {
+	const ok = (json) => {
+		const r = parseConfig(JSON.stringify(json), "/cfg");
+		assert.equal(r.ok, true, r.ok ? "" : r.error);
+		return r.config;
+	};
+	const err = (json) => {
+		const raw = typeof json === "string" ? json : JSON.stringify(json);
+		const r = parseConfig(raw, "/cfg");
+		assert.equal(r.ok, false, "expected rejection");
+		return r.error;
+	};
+
+	it("accepts a minimal roster and fills in defaults", () => {
+		const c = ok({ models: ["p/a", "p/b"] });
+		assert.deepEqual(c.models, ["p/a", "p/b"]);
+		assert.equal(c.minNodes, NODES_FLOOR);
+		assert.equal(c.maxNodes, NODES_CEILING);
+		assert.equal(c.thresholdPct, DEFAULT_THRESHOLD_PCT);
+		assert.equal(c.thinking, DEFAULT_THINKING);
+		assert.equal(c.source, "/cfg");
+	});
+
+	it("trims model ids", () => {
+		assert.deepEqual(ok({ models: ["  p/a  "] }).models, ["p/a"]);
+	});
+
+	it("rejects malformed JSON, naming the source", () => {
+		assert.match(err("{not json"), /\/cfg is invalid: not valid JSON/);
+	});
+
+	it("rejects a non-object top level", () => {
+		assert.match(err(["p/a"]), /top level must be a JSON object/);
+	});
+
+	it("requires models", () => {
+		assert.match(err({}), /missing required "models"/);
+		assert.match(err({ models: "p/a" }), /"models" must be an array/);
+		assert.match(err({ models: [] }), /"models" is empty/);
+	});
+
+	it("rejects a blank or non-string model rather than silently dropping it", () => {
+		// Skipping it would change the roster size without saying so.
+		assert.match(err({ models: ["p/a", "  "] }), /"models\[1\]" is empty/);
+		assert.match(err({ models: ["p/a", 7] }), /"models\[1\]" must be a string, got number/);
+		assert.match(err({ models: [null] }), /"models\[0\]" must be a string, got null/);
+	});
+
+	it("accepts node bounds inside the allowed range", () => {
+		const c = ok({ models: ["p/a"], nodes: { min: 4, max: 8 } });
+		assert.equal(c.minNodes, 4);
+		assert.equal(c.maxNodes, 8);
+	});
+
+	it("rejects node bounds outside the range, non-integers, and min > max", () => {
+		assert.match(err({ models: ["p/a"], nodes: { min: 2 } }), /"nodes.min" must be between 3 and 10/);
+		assert.match(err({ models: ["p/a"], nodes: { max: 11 } }), /"nodes.max" must be between 3 and 10/);
+		assert.match(err({ models: ["p/a"], nodes: { min: 3.5 } }), /"nodes.min" must be an integer/);
+		assert.match(err({ models: ["p/a"], nodes: { min: 9, max: 4 } }), /exceeds "nodes.max"/);
+		assert.match(err({ models: ["p/a"], nodes: [] }), /"nodes" must be an object/);
+	});
+
+	it("takes threshold as a fraction and converts to integer percent", () => {
+		assert.equal(ok({ models: ["p/a"], threshold: 0.65 }).thresholdPct, 65);
+		assert.equal(ok({ models: ["p/a"], threshold: 1 }).thresholdPct, 100);
+	});
+
+	it("names the fraction-vs-percent mistake explicitly", () => {
+		assert.match(err({ models: ["p/a"], threshold: 60 }), /write 0\.6 for 60%/);
+		assert.match(err({ models: ["p/a"], threshold: 0 }), /must be a fraction/);
+		assert.match(err({ models: ["p/a"], threshold: "0.6" }), /"threshold" must be a number/);
+	});
+
+	it("validates thinking against the known levels", () => {
+		assert.equal(ok({ models: ["p/a"], thinking: "low" }).thinking, "low");
+		assert.match(err({ models: ["p/a"], thinking: "extreme" }), /"thinking" must be one of/);
+	});
+});
+
+describe("loadConfig", () => {
+	it("reports the unconfigured state with both candidate paths", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hive-cfg-"));
+		try {
+			const r = loadConfig(dir);
+			assert.equal(r.ok, false);
+			assert.match(r.error, /no model roster configured/);
+			assert.match(r.error, /\.hive-think\.json/);
+			// The agent must be told not to retry, or the autopilot loops on it.
+			assert.match(r.error, /Do not retry/);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("loads a project-local config", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hive-cfg-"));
+		try {
+			fs.writeFileSync(path.join(dir, ".hive-think.json"), JSON.stringify({ models: ["p/x"], threshold: 0.7 }));
+			const r = loadConfig(dir);
+			assert.equal(r.ok, true);
+			assert.deepEqual(r.config.models, ["p/x"]);
+			assert.equal(r.config.thresholdPct, 70);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("reports a broken project config instead of falling through to the user one", () => {
+		// Silently ignoring a config the user clearly meant to use is worse than
+		// telling them it is broken.
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hive-cfg-"));
+		try {
+			fs.writeFileSync(path.join(dir, ".hive-think.json"), "{oops");
+			const r = loadConfig(dir);
+			assert.equal(r.ok, false);
+			assert.match(r.error, /not valid JSON/);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
 });
 
-describe("ANSWER_END", function () {
-	it("is exact closing XML tag", function () {
-		assert.equal(ANSWER_END, "</ANSWER>");
+describe("unconfiguredError", () => {
+	it("lists every candidate path and a copyable example", () => {
+		const msg = unconfiguredError(["/a/.hive-think.json", "/b/hive-think.json"]);
+		assert.match(msg, /\/a\/\.hive-think\.json/);
+		assert.match(msg, /\/b\/hive-think\.json/);
+		assert.match(msg, /"models"/);
 	});
 });
 
-describe("Param validation", function () {
-	it("accepts question only", function () {
-		assert.ok(validateParams({ question: "What is 1+1?" }).valid);
+// ===========================================================================
+// aggregation-engine — slugs and parsing
+// ===========================================================================
+
+describe("normalizeSlug", () => {
+	it("canonicalises so trivial spelling differences merge", () => {
+		assert.equal(normalizeSlug("Token File Reread"), "token-file-reread");
+		assert.equal(normalizeSlug("--token__file--"), "token-file");
+		assert.equal(normalizeSlug("a/b:c"), "a-b-c");
 	});
 
-	it("accepts full params", function () {
-		assert.ok(validateParams({
-			question: "Should we use X or Y?",
-			context: "some context",
-			models: ["deepseek-v4-pro", "deepseek-v4-flash"],
-			cwd: "/tmp",
-		}).valid);
+	it("returns empty for input with nothing usable", () => {
+		assert.equal(normalizeSlug("!!!"), "");
+		assert.equal(normalizeSlug(""), "");
 	});
 
-	it("rejects missing question", function () {
-		assert.equal(validateParams({}).valid, false);
-	});
-
-	it("rejects null question", function () {
-		assert.equal(validateParams({ question: null }).valid, false);
-	});
-
-	it("rejects non-string question", function () {
-		assert.equal(validateParams({ question: 42 }).valid, false);
-	});
-
-	it("rejects non-array models", function () {
-		assert.equal(validateParams({ question: "test", models: "bad" }).valid, false);
-	});
-
-	it("rejects models array with numbers", function () {
-		assert.equal(validateParams({ question: "test", models: [1, 2] }).valid, false);
-	});
-
-	it("accepts single-element models array", function () {
-		assert.ok(validateParams({ question: "test", models: ["deepseek-v4-pro"] }).valid);
-	});
-
-	it("rejects non-string context", function () {
-		assert.equal(validateParams({ question: "test", context: 123 }).valid, false);
-	});
-
-	it("rejects non-string cwd", function () {
-		assert.equal(validateParams({ question: "test", cwd: 123 }).valid, false);
+	it("caps length", () => {
+		assert.ok(normalizeSlug("x".repeat(200)).length <= 64);
 	});
 });
 
-// ---------------------------------------------------------------------------
-// thinking-level helpers (inlined from extensions/hive-think.ts)
-// ---------------------------------------------------------------------------
-
-describe("resolveThinking", function () {
-	it("passes through each valid level", function () {
-		for (const lvl of THINKING_LEVELS) {
-			assert.equal(resolveThinking(lvl), lvl, lvl + " should pass through");
-		}
+describe("extractJsonValue", () => {
+	it("parses bare JSON", () => {
+		assert.deepEqual(extractJsonValue('[{"a":1}]'), [{ a: 1 }]);
 	});
 
-	it("defaults to xhigh when missing", function () {
-		assert.equal(resolveThinking(undefined), "xhigh");
-		assert.equal(resolveThinking(null), "xhigh");
+	it("parses a fenced block", () => {
+		assert.deepEqual(extractJsonValue('prose\n```json\n[{"a":1}]\n```\nmore'), [{ a: 1 }]);
 	});
 
-	it("honors a custom fallback", function () {
-		assert.equal(resolveThinking(undefined, "low"), "low");
-		assert.equal(resolveThinking("", "low"), "low");
+	it("parses an unlabelled fence", () => {
+		assert.deepEqual(extractJsonValue("```\n{\"a\":1}\n```"), { a: 1 });
 	});
 
-	it("rejects out-of-set values → fallback", function () {
-		assert.equal(resolveThinking("ultra"), "xhigh");
-		assert.equal(resolveThinking("HIGH"), "xhigh", "case-sensitive: HIGH is not a level");
-		assert.equal(resolveThinking(5), "xhigh");
-		assert.equal(resolveThinking("medium ", "low"), "low", "whitespace not trimmed → fallback");
+	it("finds a structure embedded in prose", () => {
+		assert.deepEqual(extractJsonValue('Here you go: [{"a":1}] — done'), [{ a: 1 }]);
+	});
+
+	it("returns undefined when nothing parses", () => {
+		assert.equal(extractJsonValue("no json here"), undefined);
+		assert.equal(extractJsonValue(""), undefined);
+		assert.equal(extractJsonValue("[unclosed"), undefined);
 	});
 });
 
-describe("hive_think param validation — thinking", function () {
-	it("accepts each valid thinking level", function () {
-		for (const lvl of THINKING_LEVELS) {
-			assert.ok(validateParams({ question: "q", thinking: lvl }).valid, lvl + " should be accepted");
-		}
+describe("parsePropositions", () => {
+	it("reads the documented shape", () => {
+		const out = parsePropositions('[{"slug":"a-b","statement":"S","evidence":"f.ts:1","level":3}]');
+		assert.deepEqual(out, [{ slug: "a-b", statement: "S", evidence: "f.ts:1", level: 3 }]);
 	});
 
-	it("rejects an unknown thinking level", function () {
-		assert.equal(validateParams({ question: "q", thinking: "ultra" }).valid, false);
+	it("accepts an array under an envelope key", () => {
+		const out = parsePropositions('{"problems":[{"slug":"a","statement":"S","level":1}]}');
+		assert.equal(out.length, 1);
 	});
 
-	it("rejects a non-string thinking value", function () {
-		assert.equal(validateParams({ question: "q", thinking: 3 }).valid, false);
+	it("derives a slug from the statement when none is given", () => {
+		assert.equal(parsePropositions('[{"statement":"Token File Reread"}]')[0].slug, "token-file-reread");
 	});
 
-	it("still accepts question-only (thinking optional)", function () {
-		assert.ok(validateParams({ question: "q" }).valid);
+	it("defaults level to 1 and clamps it to 1-3", () => {
+		assert.equal(parsePropositions('[{"slug":"a","statement":"S"}]')[0].level, 1);
+		assert.equal(parsePropositions('[{"slug":"a","statement":"S","level":9}]')[0].level, 3);
+		assert.equal(parsePropositions('[{"slug":"a","statement":"S","level":0}]')[0].level, 1);
+	});
+
+	it("drops entries that assert nothing", () => {
+		assert.deepEqual(parsePropositions('[{"slug":"a"},{"statement":"   "}]'), []);
+	});
+
+	it("returns empty rather than throwing on garbage", () => {
+		assert.deepEqual(parsePropositions("not json"), []);
 	});
 });
 
-// ---------------------------------------------------------------------------
-// hive-read helpers (inlined from extensions/hive-read.ts)
-// ---------------------------------------------------------------------------
+describe("parseSolutions", () => {
+	it("reads addresses and normalises the mutex group", () => {
+		const out = parseSolutions('[{"slug":"s1","addresses":["A B","c"],"summary":"do it","mutexGroup":"Storage Choice"}]');
+		assert.deepEqual(out, [{ slug: "s1", addresses: ["a-b", "c"], summary: "do it", mutexGroup: "storage-choice" }]);
+	});
 
-function extractAnswer(text) {
-	const start = text.lastIndexOf("<ANSWER>");
-	if (start === -1) return null;
-	const end = text.lastIndexOf("</ANSWER>");
-	if (end === -1) return text.slice(start + 8).trim();
-	return text.slice(start + 8, end).trim();
-}
+	it("leaves mutexGroup absent for an independent solution", () => {
+		assert.equal("mutexGroup" in parseSolutions('[{"slug":"s","summary":"x"}]')[0], false);
+	});
 
-function findLastHiveResult(messages) {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role !== "toolResult") continue;
-		const d = msg.details;
-		if (d && d.question && d.models && d.results) return d;
-	}
-	return null;
-}
+	it("tolerates a missing addresses field", () => {
+		assert.deepEqual(parseSolutions('[{"slug":"s","summary":"x"}]')[0].addresses, []);
+	});
+});
 
-function modelOutputsFromDetails(details) {
-	return details.results.map(function (r) {
-		let text = "";
-		for (let j = r.messages.length - 1; j >= 0; j--) {
-			const m = r.messages[j];
-			if (m.role === "assistant") {
-				for (const c of m.content || []) {
-					if (c.type === "text") { text = c.text; break; }
-				}
-				if (text) break;
+describe("parseBallots", () => {
+	it("accepts the documented yes/no strings", () => {
+		assert.deepEqual(parseBallots('[{"slug":"a","vote":"yes"},{"slug":"b","vote":"no"}]'), [
+			{ slug: "a", vote: true },
+			{ slug: "b", vote: false },
+		]);
+	});
+
+	it("accepts booleans and common synonyms", () => {
+		const out = parseBallots('[{"slug":"a","vote":true},{"slug":"b","verdict":"UP"},{"slug":"c","verdict":"DOWN"}]');
+		assert.deepEqual(out.map((b) => b.vote), [true, true, false]);
+	});
+
+	it("treats an unrecognised verdict as an abstention, not a guess", () => {
+		assert.deepEqual(parseBallots('[{"slug":"a","vote":"maybe"},{"slug":"b","vote":7}]'), []);
+	});
+
+	it("keeps the reason when supplied", () => {
+		assert.equal(parseBallots('[{"slug":"a","vote":"yes","reason":"checked"}]')[0].reason, "checked");
+	});
+});
+
+// ===========================================================================
+// aggregation-engine — merge
+// ===========================================================================
+
+describe("mergePropositions", () => {
+	it("counts each node once even if it restates an item", () => {
+		// Otherwise one verbose node manufactures consensus on its own.
+		const merged = mergePropositions([
+			[
+				{ slug: "a", statement: "S", level: 1 },
+				{ slug: "a", statement: "S again", level: 1 },
+				{ slug: "a", statement: "S more", level: 1 },
+			],
+		]);
+		assert.equal(merged.length, 1);
+		assert.equal(merged[0].proposedBy, 1);
+	});
+
+	it("accumulates proposedBy across distinct nodes", () => {
+		const merged = mergePropositions([
+			[{ slug: "a", statement: "S", level: 1 }],
+			[{ slug: "a", statement: "S", level: 1 }],
+			[{ slug: "b", statement: "T", level: 1 }],
+		]);
+		assert.equal(merged.find((m) => m.slug === "a").proposedBy, 2);
+		assert.equal(merged.find((m) => m.slug === "b").proposedBy, 1);
+	});
+
+	it("keeps the deeper decomposition of the same slug", () => {
+		const merged = mergePropositions([
+			[{ slug: "a", statement: "shallow", level: 1 }],
+			[{ slug: "a", statement: "deep", evidence: "f.ts:9", level: 3 }],
+		]);
+		assert.equal(merged[0].statement, "deep");
+		assert.equal(merged[0].level, 3);
+		assert.equal(merged[0].evidence, "f.ts:9");
+	});
+
+	it("keeps evidence from a shallower node when the deeper one had none", () => {
+		const merged = mergePropositions([
+			[{ slug: "a", statement: "deep", level: 3 }],
+			[{ slug: "a", statement: "shallow", evidence: "f.ts:1", level: 1 }],
+		]);
+		assert.equal(merged[0].statement, "deep");
+		assert.equal(merged[0].evidence, "f.ts:1");
+	});
+
+	it("orders by support then depth", () => {
+		const merged = mergePropositions([
+			[{ slug: "lonely", statement: "x", level: 3 }],
+			[{ slug: "popular", statement: "y", level: 1 }],
+			[{ slug: "popular", statement: "y", level: 1 }],
+		]);
+		assert.equal(merged[0].slug, "popular");
+	});
+});
+
+// ===========================================================================
+// aggregation-engine — vote math
+// ===========================================================================
+
+describe("minVotesFor", () => {
+	it("matches the documented effective-threshold table at 60%", () => {
+		// The effective bar is chunky with integer ballots and is reported per item
+		// precisely because it drifts from the nominal 60%.
+		assert.deepEqual(
+			[3, 4, 5, 6, 7, 8, 9, 10].map((n) => minVotesFor(n, 60)),
+			[2, 3, 3, 4, 5, 5, 6, 6],
+		);
+	});
+
+	it("matches the table at 65% and 70%", () => {
+		assert.deepEqual(
+			[3, 4, 5, 6, 7, 8, 9, 10].map((n) => minVotesFor(n, 65)),
+			[2, 3, 4, 4, 5, 6, 6, 7],
+		);
+		assert.deepEqual(
+			[3, 4, 5, 6, 7, 8, 9, 10].map((n) => minVotesFor(n, 70)),
+			[3, 3, 4, 5, 5, 6, 7, 7],
+		);
+	});
+
+	it("is exact where floating point ceil is not", () => {
+		// Math.ceil(3 * 0.6) works only because 3 * 0.6 is 1.7999999999999998 and
+		// rounds up anyway; integer arithmetic does not depend on that luck.
+		for (let pct = 1; pct <= 100; pct++) {
+			for (let n = 1; n <= 10; n++) {
+				const got = minVotesFor(n, pct);
+				assert.ok(got * 100 >= n * pct, `${got}/${n} below ${pct}%`);
+				assert.ok((got - 1) * 100 < n * pct, `${got}/${n} not minimal at ${pct}%`);
 			}
 		}
-		return {
-			model: r.model,
-			exitCode: r.exitCode,
-			durationMs: r.durationMs,
-			turns: (r.usage && r.usage.turns) || 0,
-			text,
-			errorMessage: r.errorMessage,
-		};
-	});
-}
-
-describe("extractAnswer", function () {
-	it("extracts content between ANSWER tags", function () {
-		const result = extractAnswer("some thinking\n<ANSWER>\nhello world\n</ANSWER>\nmore");
-		assert.equal(result, "hello world");
 	});
 
-	it("handles unclosed ANSWER tag", function () {
-		const result = extractAnswer("thinking\n<ANSWER>\npartial");
-		assert.equal(result, "partial");
-	});
-
-	it("returns null when no ANSWER tag", function () {
-		assert.equal(extractAnswer("just text"), null);
-	});
-
-	it("uses lastIndexOf to get final ANSWER (not first)", function () {
-		const result = extractAnswer("<ANSWER>ignored</ANSWER>\nmiddle\n<ANSWER>correct</ANSWER>");
-		assert.equal(result, "correct");
-	});
-
-	it("handles empty ANSWER", function () {
-		assert.equal(extractAnswer("<ANSWER></ANSWER>"), "");
+	it("is 0 for no voters", () => {
+		assert.equal(minVotesFor(0, 60), 0);
 	});
 });
 
-describe("findLastHiveResult", function () {
-	it("finds the last hive_think tool result by details shape", function () {
-		const msgs = [
-			{ role: "user", content: [{ type: "text", text: "hi" }] },
-			{ role: "toolResult", details: { question: "Q1", models: ["a"], results: [] } },
-			{ role: "toolResult", details: { question: "Q2", models: ["b"], results: [] } },
-		];
-		const r = findLastHiveResult(msgs);
-		assert.ok(r);
-		assert.equal(r.question, "Q2");
+describe("tallyItem", () => {
+	it("passes at or above the bar and reports the actual numbers", () => {
+		const t = tallyItem("a", 3, 1, 4, 60);
+		assert.equal(t.pass, true);
+		assert.equal(t.voters, 4);
+		assert.equal(t.actualPct, 75);
+		assert.equal(t.minVotes, 3);
+		assert.equal(t.effectivePct, 75);
 	});
 
-	it("skips non-toolResult messages", function () {
-		const msgs = [
-			{ role: "user", content: [] },
-			{ role: "assistant", content: [{ type: "text", text: "ok" }] },
-			{ role: "toolResult", details: { question: "Q", models: ["x"], results: [] } },
-		];
-		const r = findLastHiveResult(msgs);
-		assert.ok(r);
-		assert.equal(r.question, "Q");
+	it("fails below the bar", () => {
+		assert.equal(tallyItem("a", 2, 2, 4, 60).pass, false);
 	});
 
-	it("returns null when no hive result present", function () {
-		const msgs = [
-			{ role: "user", content: [] },
-			{ role: "toolResult", details: { other: true } },
-		];
-		assert.equal(findLastHiveResult(msgs), null);
+	it("counts participants who skipped the item as abstentions", () => {
+		const t = tallyItem("a", 3, 1, 6, 60);
+		assert.equal(t.abstain, 2);
+		assert.equal(t.voters, 4);
 	});
 
-	it("returns null for empty array", function () {
-		assert.equal(findLastHiveResult([]), null);
+	it("refuses to pass on fewer voters than the floor", () => {
+		// 2/2 is 100% support and means nothing.
+		const t = tallyItem("a", 2, 0, 2, 60, 5);
+		assert.equal(t.actualPct, 100);
+		assert.equal(t.pass, false);
+	});
+
+	it("measures the floor against dispatched nodes, not survivors", () => {
+		// Deriving it from participants would relax the floor exactly when nodes die.
+		assert.equal(tallyItem("a", 2, 0, 2, 60, 4).pass, false);
+		// A round that was deliberately small is a different matter.
+		assert.equal(tallyItem("a", 2, 0, 2, 60, 2).pass, true);
+	});
+
+	it("does not pass with no votes at all", () => {
+		assert.equal(tallyItem("a", 0, 0, 5, 60).pass, false);
+		assert.equal(tallyItem("a", 0, 0, 5, 60).actualPct, 0);
 	});
 });
 
-describe("modelOutputsFromDetails", function () {
-	it("extracts text from last assistant message of each result", function () {
-		const details = {
-			question: "Q",
-			models: ["m1", "m2"],
-			results: [
-				{ model: "m1", exitCode: 0, durationMs: 1000, messages: [
-					{ role: "assistant", content: [{ type: "text", text: "output1" }] }
-				], usage: { turns: 2 } },
-				{ model: "m2", exitCode: 0, durationMs: 2000, messages: [
-					{ role: "assistant", content: [{ type: "text", text: "output2" }] }
-				], usage: { turns: 3 } },
+describe("tallyBallots", () => {
+	const ballot = (slug, vote) => ({ slug, vote });
+
+	it("counts one vote per node however often it repeats itself", () => {
+		const t = tallyBallots(
+			[
+				[ballot("a", true), ballot("a", true), ballot("a", true)],
+				[ballot("a", false)],
+				[ballot("a", false)],
+				[ballot("a", false)],
 			],
-		};
-		const outputs = modelOutputsFromDetails(details);
-		assert.equal(outputs.length, 2);
-		assert.equal(outputs[0].model, "m1");
-		assert.equal(outputs[0].text, "output1");
-		assert.equal(outputs[0].turns, 2);
-		assert.equal(outputs[1].model, "m2");
-		assert.equal(outputs[1].text, "output2");
-		assert.equal(outputs[1].turns, 3);
+			["a"],
+			60,
+		);
+		assert.equal(t.get("a").yes, 1);
+		assert.equal(t.get("a").no, 3);
+		assert.equal(t.get("a").pass, false);
 	});
 
-	it("handles errorMessage on result", function () {
-		const details = {
-			question: "Q",
-			models: ["m1"],
-			results: [
-				{ model: "m1", exitCode: 1, durationMs: 0, messages: [],
-				  errorMessage: "timeout", usage: {} },
-			],
-		};
-		const outputs = modelOutputsFromDetails(details);
-		assert.equal(outputs[0].text, "");
-		assert.equal(outputs[0].errorMessage, "timeout");
+	it("excludes nodes that produced nothing from the denominator", () => {
+		// A crashed node is not a dissenting vote.
+		const t = tallyBallots([[ballot("a", true)], [ballot("a", true)], [ballot("a", false)], []], ["a"], 60);
+		assert.equal(t.get("a").voters, 3);
+		assert.equal(t.get("a").yes, 2);
+	});
+
+	it("still blocks a pass when too few nodes survived", () => {
+		const t = tallyBallots([[ballot("a", true)], [ballot("a", true)], [], []], ["a"], 60);
+		assert.equal(t.get("a").actualPct, 100);
+		assert.equal(t.get("a").pass, false);
+	});
+
+	it("ignores votes for slugs that are not on the ballot", () => {
+		const t = tallyBallots([[ballot("a", true), ballot("ghost", true)]], ["a"], 60);
+		assert.equal(t.size, 1);
+		assert.equal(t.get("a").yes, 1);
+	});
+
+	it("returns a tally for every candidate, including unvoted ones", () => {
+		const t = tallyBallots([[ballot("a", true)]], ["a", "b"], 60);
+		assert.equal(t.get("b").voters, 0);
+		assert.equal(t.get("b").pass, false);
+	});
+
+	it("handles a round in which nothing came back", () => {
+		const t = tallyBallots([[], [], []], ["a"], 60);
+		assert.equal(t.get("a").voters, 0);
+		assert.equal(t.get("a").pass, false);
 	});
 });
 
+describe("tallyMutexGroups", () => {
+	const solutions = [
+		{ slug: "redis", addresses: [], summary: "r", mutexGroup: "storage" },
+		{ slug: "kafka", addresses: [], summary: "k", mutexGroup: "storage" },
+		{ slug: "nothing", addresses: [], summary: "n", mutexGroup: "storage" },
+		{ slug: "index", addresses: [], summary: "i" },
+	];
 
-// ---------------------------------------------------------------------------
-// Inlined: resolvePositiveMs + buildPartialOutput (kept in sync with hive-think.ts)
-// ---------------------------------------------------------------------------
+	const talliesFrom = (counts, participants = 14) =>
+		new Map(Object.entries(counts).map(([slug, yes]) => [slug, tallyItem(slug, yes, participants - yes, participants, 60)]));
 
-function resolvePositiveMs(raw, fallback) {
-	if (raw === undefined || raw.trim() === "") return fallback;
-	const n = Number(raw);
-	return Number.isFinite(n) && n >= 0 ? n : fallback;
-}
+	it("picks the relative majority even when nothing clears the threshold", () => {
+		// 6:5:3 leaves every option under 60%, which is the case an independent
+		// threshold cannot resolve.
+		const groups = tallyMutexGroups(solutions, talliesFrom({ redis: 6, kafka: 5, nothing: 3 }));
+		assert.equal(groups.length, 1);
+		assert.equal(groups[0].group, "storage");
+		assert.equal(groups[0].tied, false);
+		assert.equal(groups[0].leader.slug, "redis");
+		assert.deepEqual(groups[0].ranked.map((t) => t.slug), ["redis", "kafka", "nothing"]);
+	});
 
-const TEST_MODE_META = {
-	parallel: { emoji: "\u{1F41D}", label: "Hive Think" },
-};
+	it("reports a tie rather than breaking it arbitrarily", () => {
+		const groups = tallyMutexGroups(solutions, talliesFrom({ redis: 5, kafka: 5, nothing: 3 }));
+		assert.equal(groups[0].tied, true);
+		assert.equal(groups[0].leader, undefined);
+	});
 
-function buildPartialOutput(mode, question, models, lastDetails, budgetMs) {
-	const meta = TEST_MODE_META[mode];
-	const emoji = meta?.emoji || "\u{1F41D}";
-	const label = meta?.label || mode;
-	const collected = (lastDetails?.results ?? []).filter((r) => r.exitCode !== -1);
-	const completed = collected.filter((r) => r.exitCode === 0);
-	const minutes = Math.round(budgetMs / 60000);
-	const header = `${emoji} ${label} — ⏱ hive budget (${minutes}min) reached; aborted remaining nodes. ${completed.length}/${collected.length} nodes completed (partial result).`;
-	const summaries = completed.map((r) => {
-		const out = getFinalOutput(r.messages);
-		const preview = out.slice(0, 200) + (out.length > 200 ? "..." : "");
-		return `### ${r.model} ✓\n${preview || "(no output)"}`;
+	it("leaves independent solutions out of every group", () => {
+		const groups = tallyMutexGroups(solutions, talliesFrom({ redis: 6, kafka: 5, nothing: 3, index: 9 }));
+		assert.equal(groups.length, 1);
+		assert.equal(groups[0].ranked.some((t) => t.slug === "index"), false);
 	});
-	const body =
-		summaries.length > 0
-			? summaries.join("\n\n")
-			: "(No node finished before the budget. Treat hive_think as unavailable and proceed with your own analysis — do not retry blindly.)";
-	return {
-		details: { question, models, mode, results: collected },
-		output: `${header}\n\n${body}`,
-	};
-}
 
-describe("resolvePositiveMs", function () {
-	it("undefined -> fallback", function () {
-		assert.equal(resolvePositiveMs(undefined, 1800000), 1800000);
-	});
-	it("empty / whitespace -> fallback", function () {
-		assert.equal(resolvePositiveMs("", 500), 500);
-		assert.equal(resolvePositiveMs("   ", 500), 500);
-	});
-	it("valid positive number string -> parsed (trim tolerated)", function () {
-		assert.equal(resolvePositiveMs("120000", 500), 120000);
-		assert.equal(resolvePositiveMs(" 90000 ", 500), 90000);
-	});
-	it("zero -> 0 (explicitly disables the timeout)", function () {
-		assert.equal(resolvePositiveMs("0", 500), 0);
-	});
-	it("negative -> fallback (invalid)", function () {
-		assert.equal(resolvePositiveMs("-5", 500), 500);
-	});
-	it("non-numeric -> fallback", function () {
-		assert.equal(resolvePositiveMs("abc", 500), 500);
-		assert.equal(resolvePositiveMs("12ms", 500), 500);
+	it("skips group members with no tally", () => {
+		const groups = tallyMutexGroups(solutions, talliesFrom({ redis: 6 }));
+		assert.equal(groups[0].ranked.length, 1);
 	});
 });
 
-describe("buildPartialOutput", function () {
-	const mk = (model, exitCode, text) => ({
-		model, exitCode, durationMs: 0,
-		messages: text !== undefined ? [{ role: "assistant", content: [{ type: "text", text }] }] : [],
-		usage: {},
+describe("independentSolutions", () => {
+	it("selects exactly the ungrouped ones", () => {
+		const out = independentSolutions([
+			{ slug: "a", addresses: [], summary: "", mutexGroup: "g" },
+			{ slug: "b", addresses: [], summary: "" },
+		]);
+		assert.deepEqual(out.map((s) => s.slug), ["b"]);
+	});
+});
+
+// ===========================================================================
+// aggregation-engine — fan-out and selection
+// ===========================================================================
+
+describe("decideNodeCount", () => {
+	it("runs the floor when decomposition found nothing", () => {
+		const d = decideNodeCount(0, 1, 3, 10);
+		assert.equal(d.nodes, 3);
+		assert.match(d.rationale, /no propositions/);
 	});
 
-	it("lists completed nodes, drops running, reports count + budget", function () {
-		const details = { question: "Q", models: ["a", "b", "c"], results: [
-			mk("a", 0, "alpha finding"),
-			mk("b", 124, undefined),   // node timeout
-			mk("c", -1, undefined),    // still running when budget fired
-		] };
-		const { output, details: out } = buildPartialOutput("parallel", "Q", ["a", "b", "c"], details, 45 * 60000);
-		assert.match(output, /1\/2 nodes completed/, "1 completed of 2 terminal nodes (running node excluded from denominator)");
-		assert.match(output, /45min/, "header should mention the 45min budget");
-		assert.match(output, /### a/, "completed node a should be listed");
-		assert.ok(!output.includes("### b"), "timed-out node b should not be listed as completed");
-		assert.equal(out.results.length, 2, "running node (-1) dropped; completed+failed kept (2)");
+	it("scales with the number of distinct problems", () => {
+		assert.equal(decideNodeCount(1, 1, 3, 10).nodes, 3);
+		assert.equal(decideNodeCount(4, 1, 3, 10).nodes, 4);
+		assert.equal(decideNodeCount(8, 1, 3, 10).nodes, 6);
 	});
 
-	it("no completed nodes -> explicit proceed-on-your-own fallback (never empty)", function () {
-		const details = { question: "Q", models: ["a", "b"], results: [
-			mk("a", 130, undefined), mk("b", -1, undefined),
-		] };
-		const { output } = buildPartialOutput("parallel", "Q", ["a", "b"], details, 45 * 60000);
-		assert.match(output, /0\/1 nodes completed/);
-		assert.match(output, /proceed with your own analysis/, "must tell the agent to fall back, not hang/retry");
+	it("adds width for a deeper decomposition", () => {
+		assert.ok(decideNodeCount(4, 3, 3, 10).nodes > decideNodeCount(4, 1, 3, 10).nodes);
 	});
 
-	it("undefined lastDetails does not throw -> 0/N fallback", function () {
-		const { output } = buildPartialOutput("parallel", "Q", ["a"], undefined, 30 * 60000);
-		assert.match(output, /0\/0 nodes completed/);
-		assert.match(output, /proceed with your own analysis/);
+	it("stays inside the configured bounds and says when it clamped", () => {
+		const capped = decideNodeCount(40, 3, 3, 10);
+		assert.equal(capped.nodes, 10);
+		assert.match(capped.rationale, /capped at 10/);
+
+		const raised = decideNodeCount(1, 1, 6, 10);
+		assert.equal(raised.nodes, 6);
+		assert.match(raised.rationale, /floor/);
 	});
 
-	it("unknown mode -> falls back to mode name (no crash on missing MODE_META)", function () {
-		const { output } = buildPartialOutput("mystery_mode", "Q", [], { results: [] }, 60000);
-		assert.match(output, /mystery_mode/);
+	it("tolerates inverted bounds", () => {
+		const d = decideNodeCount(5, 2, 10, 3);
+		assert.ok(d.nodes >= 3 && d.nodes <= 10);
+	});
+
+	it("never exceeds the ceiling for any plausible input", () => {
+		for (let p = 0; p <= 50; p++) {
+			for (let l = 1; l <= 3; l++) {
+				const n = decideNodeCount(p, l, NODES_FLOOR, NODES_CEILING).nodes;
+				assert.ok(n >= NODES_FLOOR && n <= NODES_CEILING, `${p}/${l} gave ${n}`);
+			}
+		}
+	});
+});
+
+describe("drawNodes", () => {
+	it("repeats the roster round-robin so a small roster still fans out", () => {
+		assert.deepEqual(drawNodes(["a", "b"], 5), ["a", "b", "a", "b", "a"]);
+	});
+
+	it("truncates when the roster is longer than the draw", () => {
+		assert.deepEqual(drawNodes(["a", "b", "c"], 2), ["a", "b"]);
+	});
+
+	it("returns nothing for an empty roster or a non-positive count", () => {
+		assert.deepEqual(drawNodes([], 3), []);
+		assert.deepEqual(drawNodes(["a"], 0), []);
+	});
+});
+
+// ===========================================================================
+// aggregation-engine — formatting
+// ===========================================================================
+
+describe("formatVoteLine", () => {
+	it("always shows actual support alongside the bar that was applied", () => {
+		const line = formatVoteLine("`a` — S", tallyItem("a", 3, 1, 4, 60));
+		assert.match(line, /✅/);
+		assert.match(line, /3\/4/);
+		assert.match(line, /75%/);
+		assert.match(line, /needed 3 = 75%/);
+	});
+
+	it("marks a failure", () => {
+		assert.match(formatVoteLine("x", tallyItem("a", 1, 3, 4, 60)), /❌/);
+	});
+
+	it("names abstentions", () => {
+		assert.match(formatVoteLine("x", tallyItem("a", 3, 1, 6, 60)), /2 abstained/);
+	});
+
+	it("flags a sample too small to mean anything", () => {
+		const line = formatVoteLine("x", tallyItem("a", 2, 0, 2, 60, 5));
+		assert.match(line, /too few voters/);
+		assert.ok(MIN_VOTERS >= 3);
 	});
 });

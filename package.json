@@ -1,8 +1,8 @@
 {
   "name": "hive-think",
   "version": "1.0.0",
-  "description": "Deep multi-model parallel reasoning for pi coding agent — 4× deepseek-v4-pro + 4× deepseek-v4-flash, all with thinking xhigh",
-  "keywords": ["pi-package", "hive-think", "pi-coding-agent", "multi-model", "deep-reasoning"],
+  "description": "Deep multi-model reasoning for pi coding agent — decompose to first principles, vote on what is real, solve, vote again",
+  "keywords": ["pi-package", "hive-think", "pi-coding-agent", "multi-model", "deep-reasoning", "consensus"],
   "author": "",
   "license": "MIT",
   "type": "module",
@@ -12,7 +12,6 @@
       "./extensions/hive-think.ts",
       "./extensions/hive-think-autopilot.ts",
       "./extensions/hive-read.ts",
-      "./extensions/swarm-review.ts",
       "./extensions/hive-status.ts",
       "./extensions/hive-abort.ts",
       "./extensions/hive-list.ts"

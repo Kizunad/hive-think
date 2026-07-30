@@ -12,21 +12,16 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { backgroundManager } from "./background-manager.js";
+import { extractAnswerBlock } from "./hive-util.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function extractAnswer(text: string): string | null {
-	const start = text.lastIndexOf("<ANSWER>");
-	if (start === -1) return null;
-	const end = text.lastIndexOf("</ANSWER>");
-	if (end === -1) return text.slice(start + 8).trim();
-	return text.slice(start + 8, end).trim();
-}
-
 interface ModelOutput {
 	model: string;
+	/** Which pipeline stage the node belonged to, when known. */
+	stage?: string;
 	exitCode: number;
 	durationMs: number;
 	turns: number;
@@ -34,11 +29,30 @@ interface ModelOutput {
 	errorMessage?: string;
 }
 
+/**
+ * Node results as persisted to the session: flattened to `text` rather than a
+ * message list, so this is deliberately not the runner's ModelResult.
+ */
+interface PersistedResult {
+	model: string;
+	stage?: string;
+	exitCode: number;
+	durationMs?: number;
+	text?: string;
+	messages?: any[];
+	turns?: number;
+	usage?: { turns?: number };
+	errorMessage?: string;
+}
+
 interface HiveDetails {
 	question: string;
 	models: string[];
+	nodes?: number;
+	stages?: string[];
 	results: Array<{
 		model: string;
+		stage?: string;
 		exitCode: number;
 		durationMs: number;
 		messages: Array<any>;
@@ -72,17 +86,27 @@ function findLastHiveResult(entries: any[]): HiveDetails | null {
 }
 
 function modelOutputsFromDetails(details: HiveDetails): ModelOutput[] {
-	return details.results.map((r) => {
-		let text = extractTextFromMessages(r.messages);
-		return {
-			model: r.model,
-			exitCode: r.exitCode,
-			durationMs: r.durationMs,
-			turns: r.usage?.turns ?? 0,
-			text,
-			errorMessage: r.errorMessage,
-		};
-	});
+	return details.results.map((r) => ({
+		model: r.model,
+		stage: r.stage,
+		exitCode: r.exitCode,
+		durationMs: r.durationMs,
+		turns: r.usage?.turns ?? 0,
+		text: extractTextFromMessages(r.messages),
+		errorMessage: r.errorMessage,
+	}));
+}
+
+function outputsFromPersisted(results: PersistedResult[]): ModelOutput[] {
+	return results.map((r) => ({
+		model: r.model,
+		stage: r.stage,
+		exitCode: r.exitCode,
+		durationMs: r.durationMs || 0,
+		turns: r.usage?.turns ?? r.turns ?? 0,
+		text: typeof r.text === "string" ? r.text : extractTextFromMessages(r.messages ?? []),
+		errorMessage: r.errorMessage,
+	}));
 }
 
 function extractTextFromMessages(messages: any[]): string {
@@ -126,17 +150,25 @@ function formatOutput(
 
 	const parts: string[] = [];
 	const scope = filtered.length === allOutputs.length
-		? `All ${allOutputs.length} models`
-		: `Model${filtered.length > 1 ? "s" : ""}: ${targetModel}`;
+		? `All ${allOutputs.length} node${allOutputs.length === 1 ? "" : "s"}`
+		: `Node${filtered.length > 1 ? "s" : ""} matching "${targetModel}" (${filtered.length}/${allOutputs.length})`;
 	parts.push(`${scope} from ${source}`);
 
+	// A roster repeats models across stages, so the model name alone no longer
+	// identifies a node — label each with its stage and index.
+	let lastStage: string | undefined;
 	for (const o of filtered) {
+		if (o.stage && o.stage !== lastStage) {
+			lastStage = o.stage;
+			parts.push(`\n━━ ${o.stage}`);
+		}
+		const index = allOutputs.indexOf(o);
 		const status = o.exitCode === 0 ? "✓" : "✗";
 		const duration = `[${(o.durationMs / 1000).toFixed(1)}s, ${o.turns} turns]`;
 
 		if (extract) {
-			const answer = extractAnswer(o.text);
-			parts.push(`\n### ${o.model} ${status} ${duration}`);
+			const answer = extractAnswerBlock(o.text);
+			parts.push(`\n### [${index}] ${o.model} ${status} ${duration}`);
 			if (o.errorMessage) {
 				parts.push(`Error: ${o.errorMessage}`);
 			} else if (answer) {
@@ -147,7 +179,7 @@ function formatOutput(
 		} else {
 			const lines = o.text.split("\n");
 			const page = lines.slice(offset, offset + limit);
-			parts.push(`\n### ${o.model} ${status} ${duration}`);
+			parts.push(`\n### [${index}] ${o.model} ${status} ${duration}`);
 			if (o.errorMessage) parts.push(`Error: ${o.errorMessage}`);
 			parts.push(`(lines ${offset + 1}-${Math.min(offset + limit, lines.length)} of ${lines.length}${offset + limit < lines.length ? `, use offset=${offset + limit} for next page` : ""})`);
 			parts.push(page.join("\n") || "(no output)");
@@ -155,8 +187,8 @@ function formatOutput(
 	}
 
 	if (extract && filtered.length > 1) {
-		const answered = filtered.filter((o) => extractAnswer(o.text) !== null).length;
-		parts.push(`\n---\n${answered}/${filtered.length} models produced ANSWER section. Use extract_answer=false for full output.`);
+		const answered = filtered.filter((o) => extractAnswerBlock(o.text) !== null).length;
+		parts.push(`\n---\n${answered}/${filtered.length} nodes produced an ANSWER section. Use extract_answer=false for full output.`);
 	}
 
 	return { content: [{ type: "text", text: parts.join("\n") }] };
@@ -174,7 +206,8 @@ const HiveReadParams = Type.Object({
 	),
 	model: Type.Optional(
 		Type.String({
-			description: 'Model name filter (e.g., "deepseek-v4-pro") or index (0-7). Omit for all models.',
+			description:
+				"Filter by model name substring, or by node index (0-based, as shown in square brackets in the output). A roster repeats models across the five stages, so a name match returns every node that ran it. Omit for all nodes.",
 		}),
 	),
 	extract_answer: Type.Optional(
@@ -223,23 +256,32 @@ export default function (pi: ExtensionAPI) {
 				const entries = ctx.sessionManager?.getEntries?.() ?? [];
 				for (const entry of entries) {
 					if ((entry as any).customType === "hive:result" && (entry as any).data?.sessionId === sessionId) {
-						const modelResults = (entry as any).data.results as ModelResult[] | undefined;
-						if (modelResults && modelResults.length > 0) {
-							const allOutputs = modelResults.map((r: any) => ({
-								model: r.model,
-								exitCode: r.exitCode,
-								durationMs: r.durationMs || 0,
-								turns: r.usage?.turns ?? r.turns ?? 0,
-								text: typeof r.text === "string" ? r.text : extractTextFromMessages(r.messages ?? []),
-								errorMessage: r.errorMessage,
-							}));
-							return formatOutput(allOutputs, targetModel, extract, offset, limit, `Background hive \`${sessionId}\``);
+						const persisted = (entry as any).data.results as PersistedResult[] | undefined;
+						if (persisted && persisted.length > 0) {
+							const verdict = (entry as any).data.verdict as string | undefined;
+							const result = formatOutput(
+								outputsFromPersisted(persisted),
+								targetModel,
+								extract,
+								offset,
+								limit,
+								`Background hive \`${sessionId}\``,
+							);
+							// The rendered verdict carries the vote tallies, which no amount of
+							// per-node output reconstructs — lead with it.
+							if (verdict) {
+								result.content[0].text = `${verdict}\n\n---\n\n${result.content[0].text}`;
+							}
+							return result;
 						}
 					}
 				}
 
 				// Fallback: try backgroundManager (same-module only)
 				backgroundManager.init(pi);
+				// Read the verdict first: readResults is destructive and retires the hive,
+				// taking the outcome — and therefore the vote tallies — with it.
+				const verdict = backgroundManager.readOutcome(sessionId);
 				const results = backgroundManager.readResults(sessionId);
 				if (!results) {
 					const status = backgroundManager.getStatus(sessionId);
@@ -258,6 +300,7 @@ export default function (pi: ExtensionAPI) {
 
 				const allOutputs = results.map((r) => ({
 					model: r.model,
+					stage: r.stage,
 					exitCode: r.exitCode,
 					durationMs: r.durationMs,
 					turns: r.usage?.turns ?? 0,
@@ -265,7 +308,9 @@ export default function (pi: ExtensionAPI) {
 					errorMessage: r.errorMessage,
 				}));
 
-				return formatOutput(allOutputs, targetModel, extract, offset, limit, `Background hive \`${sessionId}\``);
+				const formatted = formatOutput(allOutputs, targetModel, extract, offset, limit, `Background hive \`${sessionId}\``);
+				if (verdict) formatted.content[0].text = `${verdict}\n\n---\n\n${formatted.content[0].text}`;
+				return formatted;
 			}
 
 			// ── Session history path (existing) ──

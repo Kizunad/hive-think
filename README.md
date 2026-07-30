@@ -1,12 +1,10 @@
 # 🐝 hive-think
 
-Deep multi-model parallel reasoning and swarm bug hunting for [pi coding agent](https://pi.dev).
+Deep multi-model reasoning for [pi coding agent](https://pi.dev).
 
-**hive_think**: Spawns **12 models in parallel** (4× deepseek-v4-pro + 4× deepseek-v4-flash + 4× sensenova-6.7-flash-lite by default), all with `--thinking xhigh` and read+bash tools. Each model receives the full conversation context and thinks independently. All responses are collected side-by-side for comparison.
+One tool, one workflow: **take the question apart to first principles, vote on which problems are real, propose solutions, vote again.** Every node is a peer — consensus does the arbitrating, so no single model's opinion decides the outcome.
 
-**swarm_review**: Spawns **15 cheap flash models** (sensenova-6.7-flash-lite, deepseek-v4-flash, minimax-m3, gemma-4-31b-it) in parallel for **bug/vulnerability hunting**, with consensus voting (≥80% threshold) and a pro-model jury for validation.
-
-**6 biologically-inspired thinking modes** — from simple parallel to multi-round consensus with bidirectional feedback. Ideal for architecture decisions, complex refactoring, technology choices, or any problem where multiple perspectives reduce blind spots.
+Built for architecture decisions, refactoring strategy, technology choices, and anything where a confident wrong answer is expensive.
 
 ---
 
@@ -16,225 +14,148 @@ Deep multi-model parallel reasoning and swarm bug hunting for [pi coding agent](
 pi install git:github.com/Kizunad/hive-think
 ```
 
-The package registers 4 extensions (`hive-think`, `hive-read`, `hive-think-autopilot`, `swarm-review`) and a `/hive` slash command. The autopilot injects usage guidance into every system prompt so the model knows when to use `hive_think` and `swarm_review` proactively — no manual configuration needed.
-
----
-
-## Quick Start
-
-```typescript
-// The model calls this automatically for complex decisions.
-// You can also invoke it manually:
-hive_think({
-  question: "Should we use Redis or Kafka for this use case?",
-  context: "We need a message queue for 10k msg/s with at-least-once delivery..."
-})
-```
-
-### Read results
-
-```typescript
-hive_read({})                                          // ANSWER sections from all models (default)
-hive_read({ model: "deepseek-v4-pro" })                // filter by model name
-hive_read({ model: "3" })                              // filter by index (0-based)
-hive_read({ extract_answer: false, offset: 0, limit: 200 })  // full output, paginated
-```
-
-### Opt out of autopilot
+Then **configure a model roster** — hive-think ships no defaults:
 
 ```bash
-pi config
-# Disable "hive-think-autopilot" in the extensions panel
+# project-local (wins, and can be committed for a team)
+cat > .hive-think.json <<'EOF'
+{
+  "models": ["provider/model-a", "provider/model-b", "provider/model-c"]
+}
+EOF
 ```
+
+Run `pi models` to see the ids your installation resolves.
+
+### Why there are no default models
+
+A node is spawned as `pi --model <id>`. Provider-qualified ids like `cliproxy/deepseek-v4-flash` only resolve inside the pi installation that has that provider configured — so any roster shipped in the package is one person's setup and a hard error for everyone else. An unconfigured hive tells you how to configure it and tells the agent to stop calling it; it never guesses a model.
 
 ---
 
-## 🪲 Swarm Review — Bug & Vulnerability Hunter
-
-Spawns **15 cheap flash models** in parallel (5× sensenova-6.7-flash-lite + 5× deepseek-v4-flash + 3× minimax-m3 + 2× gemma-4-31b-it) to scan code for bugs and vulnerabilities. Uses **consensus voting (≥80% threshold)** to filter false positives, then validates with a **pro-model jury** (3× deepseek-v4-pro).
-
-**Quantity over quality** — cheap models individually may hallucinate, but swarm consensus filters noise. Best for security audits, bug hunting, and pre-merge vulnerability checks.
-
-### Quick Start
-
-```typescript
-// Scan current directory for bugs
-swarm_review({})
-
-// Scan specific directory
-swarm_review({
-  targetDir: "./src",
-  excludePatterns: ["tests", "vendor"],
-  minVoteThreshold: 0.8
-})
-```
-
-### How it works
+## The workflow
 
 ```
-Phase 1: File inventory (~2s)
-  → find all source files in target directory
+0  解剖 dissect        3 nodes, full thinking
+   Each node independently decomposes the question into claims that can
+   actually be checked. ≤3 levels deep; every leaf must be verifiable
+   against code, config, data, or a command's output.
+   Nodes read, grep, and run tests — they do not decompose from imagination.
 
-Phase 2: Partition (~1s)
-  → split files into 15 groups, ≤180K chars each (2× overlap)
+1  归并 merge          1 node, cheap
+   Restatements of one problem collapse into a single candidate list.
+   This step may ONLY merge. It cannot drop a proposition it disagrees
+   with, because that would remove it from the vote — a decision this
+   step is not allowed to make.
 
-Phase 3: Parallel scan (~3-8 min)
-  → 15 flash models scan in parallel (4 concurrent)
-  → each returns JSON array of findings
+   ── fan-out decided here: 3-10 nodes, from how many distinct problems
+      decomposition found and how deep it had to go ──
 
-Phase 4: Aggregate & vote (~10ms)
-  → deduplicate by 5-line bucket fingerprints
-  → cross-model voting: ≥12/15 models agree → passes
+2  vote                N nodes, cheap
+   Every node votes yes/no on that same list. Real and material, or not.
 
-Phase 5: Pro jury (~1-2 min)
-  → 3× deepseek-v4-pro vote UP/DOWN on each passed finding
-  → ≥2/3 UP → confirmed bug
+3  解法 solve           N nodes, full thinking
+   Solutions for the problems that passed. Each solution declares which
+   propositions it addresses, and whether it is an alternative to another
+   (a shared `mutexGroup`) or an independent improvement.
+
+4  vote                N nodes, cheap
+   Independent solutions each face the threshold.
+   Alternatives are decided by relative majority, with the split shown.
 ```
 
-### Output
+### Why the fan-out is decided in the middle
 
-```
-🔴 `src/auth.ts:142` **critical** `sql-injection` — Raw SQL concat with user input (votes: 14/15, jury: 3/3 UP)
-🟠 `src/db.ts:89` **high** `sql-injection` — Unsanitized query parameter (votes: 13/15, jury: 3/3 UP)
-🟡 `src/api/handler.ts:301` **medium** `xss` — User input reflected without encoding (votes: 12/15, jury: 2/3 UP)
+Any node count chosen before decomposition is a guess. After stage 1 the hive knows how many distinct problems exist and how far it had to dig, which is exactly what determines how many independent judgements are worth paying for. Stage 0 therefore runs at the floor (3 nodes) — the cheapest way to learn how wide the rest should be.
+
+### Why consensus instead of an arbiter
+
+Earlier designs designated one node as arbiter or synthesizer. That silently downgrades the entire result whenever that slot draws a weak model, and it forces the roster to be tiered (which models are "strong" enough to arbitrate?). Voting removes the privileged slot, which is why the roster is a **flat list** — and why a 2-model roster works fine: nodes are drawn round-robin.
 
 ---
-**Stats**: 247 files · 1,234,567 chars · 183 raw findings · 12 passed vote · **8 jury-approved** · 312s
-**Coverage**: 14/15 scan models · 3/3 jury models
+
+## Reading the output
+
+```
+🐝 Hive Think — 23/24 nodes over 5 stages in 412.3s
+Fan-out: 5 propositions at depth 3 → 6 nodes
+Threshold: 60% (actual support shown per item)
+
+## Problems (2/4 confirmed)
+
+✅ `token-file-reread` — handleAuth() re-reads /etc/token on every request — 5/6 (83%, needed 4 = 67%)
+    evidence: src/auth.ts:88
+✅ `no-expiry-test` — No test exercises the expired-token path — 4/6 (67%, needed 4 = 67%)
+❌ `logging-too-verbose` — Debug logs dominate output — 2/6 (33%, needed 4 = 67%)
+❌ `db-pool-undersized` — Pool of 4 is too small — 2/3 (67%, needed 2 = 67%, 3 abstained)
+
+## Solutions — independent
+
+✅ `add-expiry-test` — Add test/auth.expiry.test.ts covering the expired-token branch — 6/6 (100%, needed 4 = 67%)
+
+## Solutions — alternatives: token-strategy
+
+1. `cache-token-in-memory` — 3/6 (50%) ◀ relative majority
+    Read /etc/token once into a module-level cache, invalidate on SIGHUP
+2. `mmap-token-file` — 2/6 (33%)
+3. `reread-but-stat-first` — 1/6 (17%)
+
+---
+**Carried by the hive**: add-expiry-test, cache-token-in-memory
+**Cost**: 47 turns ↑1.2M ↓89k R980k $2.1400
 ```
 
-### Parameters
+Three things worth reading carefully:
+
+**Actual support, not just the pass mark.** With at most ten ballots the *effective* threshold drifts from the nominal one, so every line shows the real count, the real percentage, and the bar that was actually applied. At a nominal 60%:
+
+| Nodes voting | Votes needed | Effective threshold |
+|---|---|---|
+| 3 | 2 | 67% |
+| 4 | 3 | **75%** |
+| 5 | 3 | 60% |
+| 6 | 4 | 67% |
+| 7 | 5 | 71% |
+| 8 | 5 | 63% |
+| 9 | 6 | 67% |
+| 10 | 6 | 60% |
+
+N=4 needing 75% is inherent to small integer ballots — it cannot be tuned away, only disclosed.
+
+**Abstentions and thin samples.** A node that crashed is excluded from the denominator rather than counted as a "no" — a dead node is not a dissenting opinion. But an item cannot pass on fewer than 3 actual voters no matter the percentage (2/2 is 100% and means nothing), and that floor is measured against the nodes *dispatched*, not the ones that survived. The `db-pool-undersized` line above shows the shape: 67% support, still rejected, because 3 nodes never voted on it.
+
+**An unresolved group is a real answer.** A 3:2:1 split means the hive genuinely found no majority among mutually exclusive options. The split is the useful output; breaking the tie is the calling agent's job.
+
+---
+
+## API
+
+### `hive_think`
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `targetDir` | `string` | `cwd` | Directory to scan |
-| `excludePatterns` | `string[]` | `[]` | Additional dirs to exclude |
-| `minVoteThreshold` | `number` | `0.8` | Min vote fraction to pass (0.0-1.0) |
-| `filePatterns` | `string[]` | all | Glob patterns to filter files |
+|---|---|---|---|
+| `question` | `string` | required | The question to analyze |
+| `context` | `string` | `""` | Conversation background, constraints, code, what you already tried, your current thinking. Drives decomposition quality — nodes can grep for what you missed, but not for constraints never written down. |
+| `models` | `string[]` | configured roster | Override the roster for this call. Pass models the user named. |
+| `thinking` | `"low"｜"medium"｜"high"｜"xhigh"` | configured | Depth for the dissect and solve stages. Voting stages always run cheap. |
+| `maxNodes` | `number` | configured max | Lower the fan-out ceiling when cost matters more than confidence. |
+| `cwd` | `string` | current directory | Working directory for node subprocesses |
+| `async` | `boolean` | `false` | Run in background; returns a sessionId immediately |
 
-### Cost
-
-sensenova-6.7-flash-lite is free via cliproxy Token Plan. deepseek-v4-flash is also free via cliproxy. Jury: deepseek-v4-pro ≈ $0.10-0.50 per `swarm_review` call (short jury prompts, no thinking overhead since jury prompt doesn't request reasoning).
-
----
-
-## Thinking Modes
-
-This is the centerpiece of hive-think — **6 biologically-inspired paradigms** that determine how the models collaborate. Pick based on your problem type.
-
-### Mode Decision Matrix
-
-| Mode | Emoji | Calls | Speed | Depth | Breadth | **Trigger when…** | **Avoid when…** |
-|------|-------|-------|-------|-------|---------|-------------------|-----------------|
-| `parallel` | 🐝 | 8 | ★★★★★ | ★★★ | ★★★★★ | Comparing well-scoped options; "X vs Y" decisions | You need deep, layered analysis |
-| `global_workspace` | 🧠 | 12 | ★★★ | ★★★★ | ★★★★ | The team is split; you need consensus across competing concerns | The decision is straightforward |
-| `cortical_column` | 🧱 | 7 | ★★ | ★★★★★ | ★★ | Layered architecture design; system decomposition | The problem doesn't have hierarchy |
-| `waggle_dance` | 💃 | 9 | ★★★★ | ★★★ | ★★★★★ | Creative brainstorming; exploring the full solution space | You already have a specific approach in mind |
-| `integrate_fire` | ⚡ | 13 | ★ | ★★★★★ | ★★★ | Safety-critical decisions; risk/quality assessment | Budget or time is tight |
-| `dmn_tpn` | 🌊 | 11 | ★★ | ★★★★ | ★★★★ | Open-ended exploration; "what am I missing?" | The problem framing is already clear |
-
-> Call counts from `MODE_META` in `extensions/hive-think.ts`. Cost estimates assume ~80-95% prompt cache hit rate — see [Cost](#cost).
-
-### Mode Details
-
-<details>
-<summary><b>🐝 parallel</b> — Simple parallel, all models think independently (default)</summary>
-
-All 8 models receive the same question and context, think independently, and return their outputs. The main agent compares all perspectives and makes the final call.
-
-- **How it works**: 8× `runModel()` in parallel (max 4 concurrent), each with full context. No orchestration between models.
-- **Best for**: Quick multi-perspective on well-framed problems — tech choices, library evaluations, design decisions.
-- **Trade-off**: Fastest mode but no cross-pollination — models work in isolation, so shared blind spots persist.
-</details>
-
-<details>
-<summary><b>🧠 global_workspace</b> — 2-round competition + broadcast, iterative convergence</summary>
-
-Inspired by Global Workspace Theory of consciousness. Specialists compete to get their insights into a shared workspace, then all specialists refine based on what was broadcast.
-
-- **How it works**:
-  - **Round 1**: 5 specialists (Architecture, Performance, Security, DX, Risk) produce analyses in parallel
-  - **Arbiter**: A strong model identifies the 2-3 most critical, non-obvious insights
-  - **Round 2**: All 5 specialists refine their analyses, building on the broadcast insights
-  - **Synthesis**: Final arbiter produces the definitive recommendation
-- **Best for**: Contentious decisions where you need to surface the *most important* insight from noise, and get alignment across competing concerns.
-- **Trade-off**: More calls (12 vs 8) and slower than parallel, but produces higher-confidence consensus.
-</details>
-
-<details>
-<summary><b>🧱 cortical_column</b> — Hierarchical layers with bidirectional feedback</summary>
-
-Models the brain's cortical hierarchy: bottom-up feed-forward through abstraction layers, then top-down feedback to revise lower layers.
-
-- **How it works**:
-  - **Feed-forward** (4 layers): Concrete (code-level facts) → Tactical (API design, data flow) → Architectural (module boundaries, patterns) → Strategic (long-term maintainability, business alignment)
-  - **Feedback** (2 layers): Strategic/Architectural constraints feed back down to revise Concrete and Tactical analyses
-  - **Synthesis**: Final model combines all layers into one recommendation
-- **Best for**: Deep architecture analysis where high-level strategy should constrain low-level implementation (or vice versa). System decomposition, API design, migration planning.
-- **Trade-off**: Deepest mode but narrowest breadth — excellent for architectural decisions, poor for comparing disparate options.
-</details>
-
-<details>
-<summary><b>💃 waggle_dance</b> — Scout diverse directions, converge on best</summary>
-
-Inspired by honeybee foraging: scouts explore many directions, return with findings, then the best direction is chosen and refined.
-
-- **How it works**:
-  - **Scout** (8 models): Each explores a distinct creative direction — radical, simple, robust, scalable, developer-friendly, cost-effective, hybrid, future-proof
-  - **Converge** (1 model): Evaluates all approaches, ranks them, and synthesizes a recommendation combining the best elements
-- **Best for**: Creative brainstorming, greenfield design, "what are all our options?" questions. Prevents anchoring on the first idea.
-- **Trade-off**: Great for breadth of ideas, but the converger must distill 8 diverse outputs — can miss nuance from individual scouts.
-</details>
-
-<details>
-<summary><b>⚡ integrate_fire</b> — All specialists think twice, second pass builds on first</summary>
-
-6 specialists each produce an initial analysis, then all refine based on *everyone else's* first-pass findings. Cross-pollination between specialties leads to more robust conclusions.
-
-- **How it works**:
-  - **Pass 1**: 6 specialists (Architecture, Performance, Security, DX, Risk, Cost & Maintenance) produce independent analyses
-  - **Pass 2**: All 6 refine their analyses after seeing the complete first-pass output — each specialist now considers perspectives they might have missed
-  - **Synthesis**: Final arbiter produces the recommendation, addressing points of consensus and disagreement
-- **Best for**: Risk/quality assessment, security reviews, decisions where every angle must be double-checked. High-stakes choices.
-- **Trade-off**: Most thorough mode but most expensive (13 calls). Use when the cost of a wrong decision exceeds the analysis cost.
-</details>
-
-<details>
-<summary><b>🌊 dmn_tpn</b> — Free association ↔ focused analysis cycles</summary>
-
-Inspired by neuroscience: alternates between Default Mode Network (free association, no filtering) and Task Positive Network (focused analytical evaluation). Each cycle refines the output.
-
-- **How it works**:
-  - **Phase 1 (DMN)**: 3 models brainstorm freely — no judgment, no filtering, stream-of-consciousness
-  - **Phase 2 (TPN)**: 5 models rigorously evaluate the free associations — rank by feasibility/impact, cross-reference, identify gaps
-  - **Phase 3 (DMN)**: 2 models diverge again — what was missed? What synthesis ideas emerge?
-  - **Phase 4 (TPN)**: Final arbiter produces the definitive recommendation
-- **Best for**: Open-ended exploration where you don't know what you don't know. "What should we build?", "What's the real problem here?"
-- **Trade-off**: Creative but less structured — the output may meander. Best when the problem isn't clearly framed yet.
-</details>
-
----
-
-## API Reference
-
-### `hive_think` parameters
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `question` | `string` | ✅ | — | The exact question to analyze |
-| `context` | `string` | | `""` | Full context: conversation summary, constraints, code, trade-offs discussed, your current thinking |
-| `models` | `string[]` | | 4×pro + 4×flash | Custom model list. Pass user-specified models here (e.g. `["claude-opus-4-6-thinking"]`). Any pi-compatible provider supported. |
-| `mode` | `string` | | `"parallel"` | Thinking paradigm. One of: `parallel`, `global_workspace`, `cortical_column`, `waggle_dance`, `integrate_fire`, `dmn_tpn` |
-| `cwd` | `string` | | current directory | Working directory for subprocesses |
-
-### `hive_read` parameters
+### `hive_read`
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `model` | `string` | all models | Model name filter (e.g. `"deepseek-v4-pro"`) or index (`"0"`–`"7"`) |
-| `extract_answer` | `boolean` | `true` | Extract only the `<ANSWER>...</ANSWER>` section. Set `false` for full output. |
-| `offset` | `number` | `0` | Line offset for pagination (only when `extract_answer: false`) |
-| `limit` | `number` | `150` | Max lines per model (only when `extract_answer: false`) |
+|---|---|---|---|
+| `sessionId` | `string` | — | Read a background hive instead of session history |
+| `model` | `string` | all nodes | Model-name substring, or node index as shown in `[n]`. A roster repeats models across stages, so a name match returns every node that ran it. |
+| `extract_answer` | `boolean` | `true` | Only the `<ANSWER>` section. `false` for full paginated output. |
+| `offset` / `limit` | `number` | `0` / `150` | Line pagination, when `extract_answer: false` |
+
+### Background hives
+
+`hive_status({ sessionId })`, `hive_list()`, `hive_abort({ sessionId })`.
+
+Max 5 concurrent hives; launching a sixth retires the oldest running one. Subprocess slots are shared process-wide, so background hives and a foreground call cannot multiply past the cap. Results expire 5 minutes after completion if never collected — and collecting is destructive.
 
 ### `/hive` slash command
 
@@ -242,109 +163,95 @@ Inspired by neuroscience: alternates between Default Mode Network (free associat
 /hive Should we migrate to a monorepo?
 ```
 
-Invokes `hive_think` with the full input as the question. Use for quick manual brainstorming without typing the full function call.
+---
+
+## Configuration
+
+JSON only — there are no environment variables for the roster. Searched most-specific first; the first file found is used, and a file that exists but is broken is reported rather than skipped.
+
+1. `<cwd>/.hive-think.json`
+2. `$XDG_CONFIG_HOME/pi/hive-think.json` (or `~/.config/pi/hive-think.json`)
+
+```json
+{
+  "models": ["provider/model-a", "provider/model-b", "provider/model-c"],
+  "nodes": { "min": 3, "max": 10 },
+  "threshold": 0.6,
+  "thinking": "xhigh"
+}
+```
+
+| Key | Required | Default | Notes |
+|---|---|---|---|
+| `models` | ✅ | — | Flat list of pi model ids. No tiers. Nodes drawn round-robin, so fewer entries than nodes is fine. |
+| `nodes.min` / `nodes.max` | | `3` / `10` | Fan-out bounds, each 3-10 |
+| `threshold` | | `0.6` | A **fraction**, not a percentage — `0.6`, not `60`. See the effective-threshold table above for why 0.6 rather than 0.65. |
+| `thinking` | | `"xhigh"` | Depth for dissect and solve |
+
+---
+
+## Timeouts
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `HIVE_NODE_TIMEOUT_MS` | `1800000` (30 min) | Kills one stuck node; the hive continues |
+| `HIVE_BUDGET_MS` | `2700000` (45 min) | Aborts remaining nodes, returns the stages that finished |
+
+Set either to `0` to disable. Keep `HIVE_NODE_TIMEOUT_MS < HIVE_BUDGET_MS < your outer job timeout`, so a single stuck node is killed first, the budget catches pathological stacking across five sequential stages, and the job timeout never has to fire.
+
+A budget abort is not an error: the hive returns whatever the completed stages produced, labelled with where it stopped. If nothing finished, it says so explicitly and tells the agent to proceed unaided rather than retry.
 
 ---
 
 ## Architecture
 
-### Subprocess lifecycle
+| File | Role |
+|---|---|
+| `extensions/hive-config.ts` | Config discovery, validation, and the unconfigured-state message. No pi deps. |
+| `extensions/hive-util.ts` | Pure helpers: ANSWER extraction, formatting, concurrency, semaphore. No pi deps. |
+| `extensions/aggregation-engine.ts` | Parsing, merging, and all vote math. No pi deps. |
+| `extensions/hive-runner.ts` | One node = one `pi` subprocess. Spawn, early exit, timeouts, kill escalation. |
+| `extensions/hive-pipeline.ts` | The five stages, plus outcome rendering. Driven by both the sync and background paths. |
+| `extensions/hive-think.ts` | Tool registration, parameters, TUI rendering |
+| `extensions/background-manager.ts` | Background sessions: budgets, TTL, crash recovery, notifications |
+| `extensions/hive-read.ts` | Per-node output with ANSWER extraction and pagination |
+| `extensions/hive-think-autopilot.ts` | Injects usage guidance — degrades to setup instructions when unconfigured |
 
-Each model runs as an independent `pi --mode json -p --no-session` subprocess with `--thinking xhigh` and `read,grep,find,ls,bash` tools:
+### Node lifecycle
 
 ```
-spawn → monitor stdout (JSON lines) → detect </ANSWER> → SIGTERM → collect results
+spawn → stream JSON lines → detect </ANSWER> → SIGTERM → 5s grace → SIGKILL
 ```
 
-- **ANSWER early-exit**: The system prompt instructs models to wrap final output in `<ANSWER>...</ANSWER>`. When the orchestrator detects the closing tag, it kills the subprocess immediately — saving expensive thinking tokens that would otherwise be spent on post-recommendation rambling.
-- **Per-node timeout**: A node that never emits `</ANSWER>` and never exits is killed after `HIVE_NODE_TIMEOUT_MS` (default **30 min**; SIGTERM → 5s grace → SIGKILL). It becomes a failed result (non-zero exit) rather than hanging the hive — so one stuck DeepSeek subprocess can't block the others.
-- **Overall budget**: If the whole `hive_think` call exceeds `HIVE_BUDGET_MS` (default **45 min**), still-running nodes are aborted and whatever completed is returned as a **partial result**. The hive never hangs to the caller's outer timeout (e.g. a CI job limit) with zero output. If nothing finished, the result explicitly tells the agent to proceed on its own.
-- **Kill grace**: After any SIGTERM (early-exit, per-node timeout, budget abort, or external cancel), SIGKILL after 5s if the process hasn't exited.
-- **Concurrency**: Maximum 4 subprocesses running at once (`mapWithConcurrencyLimit`), respecting API rate limits. Remaining models are queued.
+**ANSWER early exit.** Nodes wrap their output in `<ANSWER>...</ANSWER>`. The moment the closing tag lands, the subprocess is killed — everything after a node's conclusion is thinking tokens paid for and thrown away.
 
-### Timeout configuration
+**Task payload over stdin.** A long context as an argv entry trips `E2BIG` (`MAX_ARG_STRLEN` is 128KB), so the prompt goes over stdin.
 
-Both timeouts are set via environment variables (read once at load). Set `0` to disable either.
+**Process-wide concurrency.** All nodes pass through one FIFO semaphore (4 slots), so concurrent hives share the cap instead of each enforcing their own.
 
-| Env var | Default | Purpose |
-|---------|---------|---------|
-| `HIVE_NODE_TIMEOUT_MS` | `1800000` (30 min) | Hard cap per node; kills a single stuck subprocess. |
-| `HIVE_BUDGET_MS` | `2700000` (45 min) | Hard cap for the whole hive; aborts remaining nodes and returns partial. |
+### Failure modes
 
-**Invariant**: keep `HIVE_NODE_TIMEOUT_MS < HIVE_BUDGET_MS < your outer (job) timeout`, so a single stuck node is killed first, the budget catches pathological/serial stacking (sequential modes like `cortical_column` run nodes one after another), and the outer timeout never has to fire. Example for a CI job with a 60-min limit: node 30 min / budget 45 min / job 60 min.
-
-### Prompt cache strategy
-
-All models share the same **DeepSeek** provider. The HIVE_SYSTEM_PROMPT (~2.5KB of identical instructions) is sent as the first message to every model — resulting in ~80-95% cache hit rate on the system prompt and shared context. **Using mixed providers breaks this optimization** and increases costs 5-10×.
-
-### Error handling
-
-| Condition | How it manifests |
-|-----------|-----------------|
-| Model crash (non-zero exit) | `exitCode > 0`, `errorMessage` populated with last stderr line |
-| Missing ANSWER tag | Model terminated normally but output has no `<ANSWER>` block — use `hive_read({ extract_answer: false })` to inspect |
-| Per-node timeout | `exitCode 124`, `errorMessage: "node timeout after Ns"` — node killed, hive continues |
-| Overall budget reached | Remaining nodes aborted; `hive_think` returns a partial result listing the nodes that finished |
-| Aborted by user / budget | `exitCode 130`, `errorMessage: "aborted ..."`; parent signal propagated to all child processes |
-
----
-
-## Cost
-
-| Model | Input ($/M tokens) | Output ($/M) | Cache read ($/M) |
-|-------|-------------------|--------------|------------------|
-| deepseek-v4-pro | $12.00 | $24.00 | $1.20 |
-| deepseek-v4-flash | $1.00 | $2.00 | $0.20 |
-
-With prompt cache active (~80-95% hit rate on shared system prompt and context), a typical `parallel` call (8 models) costs **~$2-3**. Modes with more calls scale roughly linearly:
-
-| Mode | Calls | Typical cost (cached) |
-|------|-------|----------------------|
-| `parallel` | 8 | ~$2-3 |
-| `waggle_dance` | 9 | ~$2-3 |
-| `cortical_column` | 7 | ~$2-3 |
-| `global_workspace` | 12 | ~$3-5 |
-| `dmn_tpn` | 11 | ~$3-5 |
-| `integrate_fire` | 13 | ~$4-6 |
-
-> Without cache (e.g., mixed providers or very long contexts), costs are ~5-10× higher. Stick to DeepSeek.
-
----
-
-## System Prompt Philosophy
-
-Each model receives the `HIVE_SYSTEM_PROMPT`, a structured reasoning framework built on five principles:
-
-1. **First Principles**: Strip assumptions. Reason from fundamentals. Question whether the presented problem is the real problem.
-2. **Active Investigation**: Use `read`, `grep`, `find`, `ls`, and `bash` to look up actual code and run tests. Don't guess — verify.
-3. **Multi-Perspective**: Examine every problem from at least these angles: user/developer experience, system architecture & maintainability, performance & scalability, security & correctness.
-4. **Trade-off Analysis**: Every choice has costs — surface them explicitly with a decision matrix.
-5. **Actionable Output**: End with a clear recommendation. No hedging — commit to a position.
-
-The structured output format requires: Problem Restatement → Investigation → Constraints → Approaches (with decision matrix) → Recommendation → Risks & Mitigations, all wrapped in `<ANSWER>...</ANSWER>` for early exit.
-
----
-
-## Components
-
-| Component | File | Description |
-|-----------|------|-------------|
-| Main extension | `extensions/hive-think.ts` | Registers `hive_think` tool, 6 mode executors, subprocess orchestration |
-| Swarm review | `extensions/swarm-review.ts` | Registers `swarm_review` tool — 15-model bug/vulnerability hunter with voting |
-| Aggregation engine | `extensions/aggregation-engine.ts` | Pure TS functions for finding dedup, voting, and jury verdict analysis |
-| Autopilot | `extensions/hive-think-autopilot.ts` | Injects hive_think + swarm_review usage guidance into system prompt |
-| Result reader | `extensions/hive-read.ts` | Reads model outputs from session with ANSWER extraction + pagination |
-| Prompt template | `prompts/hive.md` | `/hive` slash command for manual invocation |
+| Condition | How it surfaces |
+|---|---|
+| Node crash | `exitCode > 0`, `errorMessage` from the last stderr line |
+| Per-node timeout | `exitCode 124`, `errorMessage: "node timeout after Ns"` — hive continues |
+| Budget reached | Remaining nodes aborted; stages that finished are returned, labelled partial |
+| Aborted | `exitCode 130`; signal propagated to every child |
+| No parseable decomposition | Halts at stage 0 and says to inspect raw output with `hive_read({ extract_answer: false })` |
+| Nothing passes the problem vote | A real result: the hive does not agree there is a confirmed problem |
+| No parseable solutions | Confirmed problems are still returned |
 
 ---
 
 ## Tests
 
 ```bash
-node --test test/index.test.js
+node --test test/index.test.js    # requires Node >= 22.18 (native TS type stripping)
 ```
 
-Test suites covering: `formatTokens`, `formatUsageStats`, `getFinalOutput`, `mapWithConcurrencyLimit`, `DEFAULT_MODELS` validation, `ANSWER_END`, parameter validation, `extractAnswer`, `findLastHiveResult`, `modelOutputsFromDetails`, `resolvePositiveMs` (timeout env parsing), `buildPartialOutput` (budget partial-result rendering).
+103 tests over `hive-util`, `hive-config`, and `aggregation-engine`, importing the real modules.
+
+Note for contributors: this package is loaded as TypeScript at runtime and never compiled, so it must stay compatible with Node's **strip-only** type removal — no `enum`, no `namespace`, no constructor parameter properties (`constructor(private x: T)`).
 
 ---
 

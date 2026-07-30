@@ -1,49 +1,27 @@
 /**
- * Background Process Manager — Singleton orchestrator for background hive_think
+ * Background Process Manager — non-blocking hive sessions
  *
- * Manages async hive_think sessions: subprocess queue, timeouts, budgets,
- * crash recovery, and TUI notifications. All hives share a single
- * MAX_CONCURRENCY=4 subprocess pool with FIFO fairness.
+ * Owns the lifecycle of `hive_think({ async: true })` runs: budgets, crash
+ * recovery, TTL, and completion notifications.
+ *
+ * It does not spawn anything itself. Both the synchronous tool call and this
+ * manager drive `runPipeline`, so the two paths cannot drift — an earlier version
+ * kept a second copy of the spawn logic here and only ever ran a single flat batch
+ * of models, which the five-stage pipeline is not.
+ *
+ * Concurrency is enforced process-wide inside hive-runner, so several background
+ * hives plus a foreground call still share one subprocess cap.
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
 import * as crypto from "node:crypto";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
-import type { Message } from "@earendil-works/pi-ai";
-import { type ExtensionAPI, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-
-import {
-	ANSWER_END,
-	getFinalOutput,
-	HIVE_SYSTEM_PROMPT,
-	NODE_TIMEOUT_MS,
-} from "./hive-think.js";
+import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { HiveConfig } from "./hive-config.js";
+import { type PipelineOutcome, renderOutcome, runPipeline, type StageName } from "./hive-pipeline.js";
+import { getFinalOutput, type ModelResult } from "./hive-runner.js";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-
-export interface ModelResult {
-	model: string;
-	exitCode: number;
-	sessionId?: string;
-	durationMs: number;
-	messages: Message[];
-	stderr: string;
-	usage: {
-		input: number;
-		output: number;
-		cacheRead: number;
-		cacheWrite: number;
-		cost: number;
-		contextTokens: number;
-		turns: number;
-	};
-	stopReason?: string;
-	errorMessage?: string;
-}
 
 export type HiveStatus = "launched" | "running" | "completed" | "aborted" | "error" | "timeout" | "lost";
 
@@ -51,26 +29,27 @@ export interface BackgroundHive {
 	sessionId: string;
 	status: HiveStatus;
 	question: string;
-	mode: string;
 	models: string[];
-	results: Map<string, ModelResult>;
-	subprocesses: ChildProcess[];
+	/** Node results in run order. Never keyed by model: a roster repeats models. */
+	results: ModelResult[];
+	outcome?: PipelineOutcome;
+	abort: AbortController;
 	startTime: number;
+	/** Set when the run finishes, so TTL is measured from completion. */
+	endTime?: number;
 	budgetMs: number;
 	notified: boolean;
+	stage?: StageName;
 	doneCount: number;
 	totalCount: number;
-	cwd: string;
-	context: string;
-	history: string;
 }
 
 export interface HiveStatusResult {
 	sessionId: string;
 	status: HiveStatus;
 	question: string;
-	mode: string;
 	models: string[];
+	stage?: string;
 	doneCount: number;
 	totalCount: number;
 	durationMs: number;
@@ -80,6 +59,7 @@ export interface HiveSummary {
 	sessionId: string;
 	status: HiveStatus;
 	question: string;
+	stage?: string;
 	doneCount: number;
 	totalCount: number;
 }
@@ -88,26 +68,23 @@ interface HiveSessionState {
 	sessionId: string;
 	status: HiveStatus;
 	question: string;
-	mode: string;
 	models: string[];
 	doneCount: number;
 	totalCount: number;
 	startTime: number;
-	results?: ModelResult[];
 }
 
-type OnProgress = (update: { sessionId: string; doneCount: number; totalCount: number }) => void;
+type OnProgress = (update: { sessionId: string; doneCount: number; totalCount: number; stage?: string }) => void;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const MAX_CONCURRENCY = 4;
-const HIVE_BUDGET_MS_DEFAULT = 45 * 60 * 1000; // 45 min
+const HIVE_BUDGET_MS_DEFAULT = 45 * 60 * 1000;
 const WATCHDOG_INTERVAL_MS = 5000;
-const TTL_MS = 5 * 60 * 1000; // 5 min after completion
+/** How long a finished hive's results stay collectable. */
+const TTL_MS = 5 * 60 * 1000;
 const MAX_HIVES = 5;
-const HIVE_TOOLS = "read,grep,find,ls,bash";
 
 // ---------------------------------------------------------------------------
 // BackgroundProcessManager
@@ -118,8 +95,6 @@ class BackgroundProcessManager {
 
 	private pi: ExtensionAPI | null = null;
 	private hives = new Map<string, BackgroundHive>();
-	private queue: Array<{ sessionId: string; model: string; nodeIndex: number }> = [];
-	private activeSlots = 0;
 	private watchdogTimer: ReturnType<typeof setInterval> | null = null;
 	private onProgress: OnProgress | null = null;
 	private shutdown = false;
@@ -131,19 +106,13 @@ class BackgroundProcessManager {
 		return BackgroundProcessManager.instance;
 	}
 
-	// -----------------------------------------------------------------------
-	// Initialization
-	// -----------------------------------------------------------------------
-
 	init(pi: ExtensionAPI) {
 		if (this.pi) return; // already initialized
 		this.pi = pi;
 
-		// Crash recovery on session start
-		pi.on("session_start", async (_event, ctx) => {
+		pi.on("session_start", async (_event: unknown, ctx: any) => {
 			try {
-				const entries = ctx.sessionManager.getEntries();
-				for (const entry of entries) {
+				for (const entry of ctx.sessionManager.getEntries()) {
 					if ((entry as any).customType === "hive:state" && (entry as any).data) {
 						this.restoreState((entry as any).data);
 					}
@@ -151,17 +120,9 @@ class BackgroundProcessManager {
 			} catch { /* best-effort recovery */ }
 		});
 
-		// Notify on agent_end
-		pi.on("agent_end", () => {
-			this.emitHiveComplete();
-		});
+		pi.on("agent_end", () => this.emitHiveComplete());
+		pi.on("session_shutdown", () => this.doShutdown());
 
-		// Cleanup on shutdown
-		pi.on("session_shutdown", () => {
-			this.doShutdown();
-		});
-
-		// Start watchdog
 		this.startWatchdog();
 	}
 
@@ -173,67 +134,117 @@ class BackgroundProcessManager {
 		question: string;
 		context: string;
 		history: string;
-		models: string[];
-		mode: string;
 		cwd: string;
+		config: HiveConfig;
+		maxNodes?: number;
 		budgetMs?: number;
 		signal?: AbortSignal;
-		onProgress?: OnProgress;
 	}): string {
-		// Enforce max hives (reject if full)
-		const active = [...this.hives.values()].filter(
-			(h) => h.status === "launched" || h.status === "running",
-		);
+		// Make room rather than refuse: the caller asked for this run, and the
+		// oldest still-running hive is the least likely to still be wanted.
+		const active = [...this.hives.values()].filter((h) => h.status === "launched" || h.status === "running");
 		if (active.length >= MAX_HIVES) {
-			// Abort oldest to make room
 			const oldest = active.sort((a, b) => a.startTime - b.startTime)[0];
 			if (oldest) this.abortHive(oldest.sessionId);
 		}
 
 		const sessionId = crypto.randomBytes(6).toString("hex");
-		const nodeCount = params.models.length;
-
 		const hive: BackgroundHive = {
 			sessionId,
 			status: "launched",
 			question: params.question,
-			mode: params.mode,
-			models: [...params.models],
-			results: new Map(),
-			subprocesses: [],
+			models: [...params.config.models],
+			results: [],
+			abort: new AbortController(),
 			startTime: Date.now(),
 			budgetMs: params.budgetMs ?? HIVE_BUDGET_MS_DEFAULT,
 			notified: false,
 			doneCount: 0,
-			totalCount: nodeCount,
-			cwd: params.cwd,
-			context: params.context,
-			history: params.history,
+			// Not yet known: the fan-out is decided after decomposition, so this is a
+			// floor that grows once the pipeline reports its first stage.
+			totalCount: params.config.minNodes,
 		};
-
 		this.hives.set(sessionId, hive);
-
-		// Enqueue all nodes
-		for (let i = 0; i < nodeCount; i++) {
-			this.queue.push({ sessionId, model: params.models[i], nodeIndex: i });
-		}
-
-		// Persist launch state
 		this.persistState(hive);
 
-		// Start processing
-		this.processQueue();
-
-		// Register abort signal
 		if (params.signal) {
-			if (params.signal.aborted) {
-				this.abortHive(sessionId);
-			} else {
-				params.signal.addEventListener("abort", () => this.abortHive(sessionId), { once: true });
-			}
+			if (params.signal.aborted) this.abortHive(sessionId);
+			else params.signal.addEventListener("abort", () => this.abortHive(sessionId), { once: true });
 		}
 
+		void this.drive(hive, params);
 		return sessionId;
+	}
+
+	private async drive(
+		hive: BackgroundHive,
+		params: { question: string; context: string; history: string; cwd: string; config: HiveConfig; maxNodes?: number },
+	) {
+		// An abort can land between `launchHive` registering the hive and this
+		// running — an already-aborted signal aborts it synchronously. Without this
+		// guard the status would be overwritten back to "running".
+		if (hive.status !== "launched") return;
+
+		hive.status = "running";
+		this.persistState(hive);
+
+		try {
+			const outcome = await runPipeline({
+				question: params.question,
+				context: params.context,
+				history: params.history,
+				cwd: params.cwd,
+				config: params.config,
+				maxNodes: params.maxNodes,
+				signal: hive.abort.signal,
+				onProgress: (progress) => {
+					hive.stage = progress.stage;
+					hive.results = progress.results;
+					hive.doneCount = progress.results.filter((r) => r.exitCode !== -1).length;
+					hive.totalCount = Math.max(hive.totalCount, hive.doneCount, progress.total);
+					this.onProgress?.({
+						sessionId: hive.sessionId,
+						doneCount: hive.doneCount,
+						totalCount: hive.totalCount,
+						stage: progress.stage,
+					});
+				},
+			});
+
+			hive.outcome = outcome;
+			hive.results = outcome.results;
+			hive.doneCount = outcome.results.length;
+			hive.totalCount = outcome.results.length;
+			// Only claim a terminal status if nothing already set one. The watchdog marks
+			// a budget overrun as "timeout" and then aborts; overwriting that with the
+			// generic "aborted" would lose why the run stopped. An aborted run still
+			// carries whatever the finished stages produced either way.
+			if (hive.status === "running") {
+				hive.status = hive.abort.signal.aborted ? "aborted" : "completed";
+			}
+		} catch (err) {
+			hive.status = "error";
+			hive.outcome = undefined;
+			const message = err instanceof Error ? err.message : String(err);
+			// Surface the failure where hive_read looks, so a crashed pipeline is not
+			// an empty result with no explanation.
+			hive.results = [
+				...hive.results,
+				{
+					model: "(pipeline)",
+					exitCode: 1,
+					durationMs: Date.now() - hive.startTime,
+					messages: [],
+					stderr: "",
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+					errorMessage: `pipeline failed: ${message}`,
+				},
+			];
+		} finally {
+			hive.endTime = Date.now();
+			this.persistState(hive);
+			this.emitHiveComplete();
+		}
 	}
 
 	// -----------------------------------------------------------------------
@@ -247,23 +258,33 @@ class BackgroundProcessManager {
 			sessionId: hive.sessionId,
 			status: hive.status,
 			question: hive.question,
-			mode: hive.mode,
 			models: hive.models,
+			stage: hive.stage,
 			doneCount: hive.doneCount,
 			totalCount: hive.totalCount,
-			durationMs: Date.now() - hive.startTime,
+			durationMs: (hive.endTime ?? Date.now()) - hive.startTime,
 		};
 	}
 
+	private isFinished(status: HiveStatus): boolean {
+		return status === "completed" || status === "error" || status === "timeout" || status === "aborted";
+	}
+
+	/** Destructive: collecting a finished hive's results also retires it. */
 	readResults(sessionId: string): ModelResult[] | null {
 		const hive = this.hives.get(sessionId);
 		if (!hive) return null;
-		if (hive.status !== "completed" && hive.status !== "error" && hive.status !== "timeout") {
-			return null; // not ready yet
-		}
-		const results = [...hive.results.values()];
-		this.hives.delete(sessionId); // destructive read
+		if (!this.isFinished(hive.status)) return null; // still running
+		const results = hive.results;
+		this.hives.delete(sessionId);
 		return results;
+	}
+
+	/** The rendered verdict for a finished hive, if the pipeline got far enough. */
+	readOutcome(sessionId: string): string | null {
+		const hive = this.hives.get(sessionId);
+		if (!hive?.outcome) return null;
+		return renderOutcome(hive.outcome);
 	}
 
 	listHives(): HiveSummary[] {
@@ -274,6 +295,7 @@ class BackgroundProcessManager {
 				sessionId: h.sessionId,
 				status: h.status,
 				question: h.question.slice(0, 80),
+				stage: h.stage,
 				doneCount: h.doneCount,
 				totalCount: h.totalCount,
 			}));
@@ -282,267 +304,22 @@ class BackgroundProcessManager {
 	abortHive(sessionId: string): boolean {
 		const hive = this.hives.get(sessionId);
 		if (!hive) return false;
-		if (hive.status === "completed" || hive.status === "aborted" || hive.status === "lost") {
-			return false;
-		}
+		if (this.isFinished(hive.status) || hive.status === "lost") return false;
 
 		hive.status = "aborted";
-		for (const proc of hive.subprocesses) {
-			try { proc.kill("SIGTERM"); } catch { /* already dead */ }
-		}
-		// Remove pending nodes from queue
-		this.queue = this.queue.filter((q) => q.sessionId !== sessionId);
-		this.processQueue();
+		// The pipeline propagates this to every live subprocess; `drive` records
+		// whatever had already completed.
+		hive.abort.abort();
 		this.persistState(hive);
 		return true;
 	}
 
 	get completedUnnotified(): BackgroundHive[] {
-		return [...this.hives.values()].filter(
-			(h) => h.status === "completed" && !h.notified,
-		);
+		return [...this.hives.values()].filter((h) => this.isFinished(h.status) && !h.notified);
 	}
 
 	// -----------------------------------------------------------------------
-	// Internal: Subprocess Queue
-	// -----------------------------------------------------------------------
-
-	private async processQueue() {
-		while (this.activeSlots < MAX_CONCURRENCY && this.queue.length > 0 && !this.shutdown) {
-			const next = this.queue.shift()!;
-			const hive = this.hives.get(next.sessionId);
-			if (!hive || hive.status === "aborted" || hive.status === "timeout") continue;
-
-			this.activeSlots++;
-			if (hive.status === "launched") {
-				hive.status = "running";
-				this.persistState(hive);
-			}
-
-			this.spawnNode(hive, next.model, next.nodeIndex);
-		}
-	}
-
-	private async spawnNode(hive: BackgroundHive, model: string, nodeIndex: number) {
-		const startTime = Date.now();
-
-		let tmpPromptDir: string | null = null;
-		let tmpPromptPath: string | null = null;
-
-		const result: ModelResult = {
-			model,
-			exitCode: 0,
-			durationMs: 0,
-			messages: [],
-			stderr: "",
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		};
-
-		try {
-			// Write system prompt to temp file
-			tmpPromptDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-bg-hive-"));
-			tmpPromptPath = path.join(tmpPromptDir, "system-prompt.md");
-			await withFileMutationQueue(tmpPromptPath, async () => {
-				await fs.promises.writeFile(tmpPromptPath!, HIVE_SYSTEM_PROMPT, {
-					encoding: "utf-8",
-					mode: 0o600,
-				});
-			});
-
-			const args = [
-				"--mode", "json",
-				"-p",
-				"--no-session",
-				"--model", model,
-				"--thinking", "xhigh",
-				"--tools", HIVE_TOOLS,
-				"--append-system-prompt", tmpPromptPath,
-			];
-
-			const currentScript = process.argv[1];
-			let command: string;
-			let cmdArgs: string[];
-			if (currentScript && !currentScript.startsWith("/$bunfs/root/") && fs.existsSync(currentScript)) {
-				command = process.execPath;
-				cmdArgs = [currentScript, ...args];
-			} else {
-				command = "pi";
-				cmdArgs = args;
-			}
-
-			const taskContent = [
-				hive.history ? `## Full Conversation History\n${hive.history}` : "",
-				hive.context ? `## Additional Context\n${hive.context}` : "",
-				`## Question\n${hive.question}`,
-			].filter(Boolean).join("\n\n");
-
-			const proc = spawn(command, cmdArgs, {
-				cwd: hive.cwd,
-				shell: false,
-				stdio: ["pipe", "pipe", "pipe"],
-			});
-
-			hive.subprocesses.push(proc);
-
-			let procExited = false;
-			let killTimer: ReturnType<typeof setTimeout> | undefined;
-			proc.once("exit", () => {
-				procExited = true;
-				if (killTimer) clearTimeout(killTimer);
-			});
-			const terminate = () => {
-				proc.kill("SIGTERM");
-				if (!killTimer) {
-					killTimer = setTimeout(() => {
-						if (!procExited) proc.kill("SIGKILL");
-					}, 5000);
-				}
-			};
-
-			// Per-node timeout
-			let nodeTimer: ReturnType<typeof setTimeout> | undefined;
-			let nodeTimedOut = false;
-			if (NODE_TIMEOUT_MS > 0) {
-				nodeTimer = setTimeout(() => {
-					nodeTimedOut = true;
-					terminate();
-				}, NODE_TIMEOUT_MS);
-			}
-
-			// Write task via stdin
-			proc.stdin.on("error", () => { /* EPIPE, ignore */ });
-			proc.stdin.write(taskContent);
-			proc.stdin.end();
-
-			let buffer = "";
-			let resolved = false;
-			let doneCalled = false;
-
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try { event = JSON.parse(line); } catch { return; }
-
-				if (event.type === "session" && event.id) {
-					result.sessionId = event.id as string;
-				}
-
-				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message;
-					result.messages.push(msg);
-
-					if (msg.role === "assistant") {
-						result.usage.turns++;
-						const usage = msg.usage;
-						if (usage) {
-							result.usage.input += usage.input || 0;
-							result.usage.output += usage.output || 0;
-							result.usage.cacheRead += usage.cacheRead || 0;
-							result.usage.cacheWrite += usage.cacheWrite || 0;
-							result.usage.cost += usage.cost?.total || 0;
-							result.usage.contextTokens = usage.totalTokens || 0;
-						}
-						if (msg.stopReason) result.stopReason = msg.stopReason;
-						if (msg.errorMessage) result.errorMessage = msg.errorMessage;
-
-						for (const part of msg.content) {
-							if (part.type === "text" && (part as any).text?.includes(ANSWER_END)) {
-								resolved = true;
-								if (nodeTimer) clearTimeout(nodeTimer);
-								result.exitCode = 0;
-								done();
-								return;
-							}
-						}
-					}
-				}
-
-				if (event.type === "tool_result_end" && event.message) {
-					result.messages.push(event.message as Message);
-				}
-			};
-
-			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
-			});
-
-			proc.stderr.on("data", (data) => {
-				result.stderr += data.toString();
-			});
-
-			const done = () => {
-				if (doneCalled) return;
-				doneCalled = true;
-
-				if (nodeTimer) clearTimeout(nodeTimer);
-
-				if (nodeTimedOut && result.exitCode !== 0 && !result.errorMessage) {
-					result.errorMessage = `node timeout after ${Math.round(NODE_TIMEOUT_MS / 1000)}s`;
-				}
-				if (!result.errorMessage && result.stderr.trim()) {
-					result.errorMessage = `stderr: ${result.stderr.trim().split("\n")[0].slice(0, 120)}`;
-				}
-
-				result.durationMs = Date.now() - startTime;
-				hive.results.set(model, result);
-
-				// Cleanup temp files
-				if (tmpPromptPath) try { fs.unlinkSync(tmpPromptPath); } catch { /* ignore */ }
-				if (tmpPromptDir) try { fs.rmdirSync(tmpPromptDir); } catch { /* ignore */ }
-
-				// Notify and process queue
-				this.activeSlots--;
-				this.onNodeComplete(hive);
-				this.processQueue();
-			};
-
-			proc.on("close", (code) => {
-				if (buffer.trim()) processLine(buffer);
-				result.exitCode = nodeTimedOut ? 124 : (code ?? 0);
-				if (!resolved) done();
-			});
-
-			proc.on("error", () => {
-				result.exitCode = 1;
-				if (!resolved) done();
-			});
-
-		} catch (err: any) {
-			result.exitCode = 1;
-			result.errorMessage = err?.message || "spawn failed";
-			hive.results.set(model, result);
-			this.activeSlots--;
-			this.onNodeComplete(hive);
-			this.processQueue();
-
-			if (tmpPromptPath) try { fs.unlinkSync(tmpPromptPath); } catch { /* ignore */ }
-			if (tmpPromptDir) try { fs.rmdirSync(tmpPromptDir); } catch { /* ignore */ }
-		}
-	}
-
-	private onNodeComplete(hive: BackgroundHive) {
-		hive.doneCount++;
-
-		this.onProgress?.({
-			sessionId: hive.sessionId,
-			doneCount: hive.doneCount,
-			totalCount: hive.totalCount,
-		});
-
-		// Check if all nodes done
-		if (hive.doneCount >= hive.totalCount) {
-			hive.status = "completed";
-			hive.startTime = Date.now(); // update for TTL tracking
-			this.persistState(hive);
-			this.emitHiveComplete();
-		}
-	}
-
-	// -----------------------------------------------------------------------
-	// Watchdog: checks budgets and emits notifications
+	// Watchdog
 	// -----------------------------------------------------------------------
 
 	private startWatchdog() {
@@ -559,12 +336,8 @@ class BackgroundProcessManager {
 		for (const hive of this.hives.values()) {
 			if (hive.status !== "running") continue;
 			if (now - hive.startTime > hive.budgetMs) {
+				hive.abort.abort();
 				hive.status = "timeout";
-				for (const proc of hive.subprocesses) {
-					try { proc.kill("SIGTERM"); } catch { /* dead */ }
-				}
-				this.queue = this.queue.filter((q) => q.sessionId !== hive.sessionId);
-				this.processQueue();
 				this.persistState(hive);
 			}
 		}
@@ -573,10 +346,10 @@ class BackgroundProcessManager {
 	private checkTTL() {
 		const now = Date.now();
 		for (const [id, hive] of this.hives) {
-			if (
-				(hive.status === "completed" || hive.status === "error" || hive.status === "timeout") &&
-				now - hive.startTime > TTL_MS
-			) {
+			if (!this.isFinished(hive.status)) continue;
+			// Measured from completion, not from launch — a long run would otherwise
+			// expire the instant it finished.
+			if (now - (hive.endTime ?? hive.startTime) > TTL_MS) {
 				hive.status = "lost";
 				this.persistState(hive);
 				this.hives.delete(id);
@@ -588,45 +361,48 @@ class BackgroundProcessManager {
 		if (!this.pi) return;
 		for (const hive of this.completedUnnotified) {
 			hive.notified = true;
-			const allResults = [...hive.results.values()];
-			const successCount = allResults.filter((r) => r.exitCode === 0).length;
-			const icon = hive.status === "timeout" ? "⏱" : "🐝";
+			const successCount = hive.results.filter((r) => r.exitCode === 0).length;
+			const icon = hive.status === "timeout" ? "⏱" : hive.status === "completed" ? "🐝" : "⚠";
 
-			// Build summary: list each model with brief output
-			const summaries = allResults.map((r) => {
-				const status = r.exitCode === 0 ? "✓" : "✗";
-				const output = getFinalOutput(r.messages);
-				const preview = output.slice(0, 150).replace(/\n/g, " ");
-				return `### ${r.model} ${status} [${(r.durationMs / 1000).toFixed(1)}s]\n${preview || (r.errorMessage ? `Error: ${r.errorMessage}` : "(no output)")}`;
-			}).join("\n\n");
+			const verdict = hive.outcome
+				? renderOutcome(hive.outcome)
+				: hive.results
+						.map((r) => {
+							const status = r.exitCode === 0 ? "✓" : "✗";
+							const preview = getFinalOutput(r.messages).slice(0, 150).replace(/\n/g, " ");
+							return `### ${r.model} ${status} [${(r.durationMs / 1000).toFixed(1)}s]\n${preview || (r.errorMessage ? `Error: ${r.errorMessage}` : "(no output)")}`;
+						})
+						.join("\n\n");
 
-			const msg = [
-				`${icon} Background hive \`${hive.sessionId}\` complete: **${successCount}/${hive.totalCount}** models finished (${hive.mode} mode).`,
-				"",
-				summaries,
-				"",
-				`Read full results: \`hive_read({ sessionId: "${hive.sessionId}" })\``,
-			].join("\n");
-
-			this.pi.sendMessage({
-				customType: "hive_complete",
-				content: msg,
-				display: false,
-				details: {
-					sessionId: hive.sessionId,
-					status: hive.status,
-					question: hive.question.slice(0, 100),
-					successCount,
-					totalCount: hive.totalCount,
-					results: allResults.map((r) => ({
-						model: r.model,
-						exitCode: r.exitCode,
-						durationMs: r.durationMs,
-						text: getFinalOutput(r.messages),
-						errorMessage: r.errorMessage,
-					})),
+			this.pi.sendMessage(
+				{
+					customType: "hive_complete",
+					content: [
+						`${icon} Background hive \`${hive.sessionId}\` ${hive.status}: **${successCount}/${hive.results.length}** nodes finished.`,
+						"",
+						verdict,
+						"",
+						`Read full per-node output: \`hive_read({ sessionId: "${hive.sessionId}" })\``,
+					].join("\n"),
+					display: false,
+					details: {
+						sessionId: hive.sessionId,
+						status: hive.status,
+						question: hive.question.slice(0, 100),
+						successCount,
+						totalCount: hive.results.length,
+						results: hive.results.map((r) => ({
+							model: r.model,
+							stage: r.stage,
+							exitCode: r.exitCode,
+							durationMs: r.durationMs,
+							text: getFinalOutput(r.messages),
+							errorMessage: r.errorMessage,
+						})),
+					},
 				},
-			}, { triggerTurn: false });
+				{ triggerTurn: false },
+			);
 		}
 	}
 
@@ -641,25 +417,27 @@ class BackgroundProcessManager {
 				sessionId: hive.sessionId,
 				status: hive.status,
 				question: hive.question,
-				mode: hive.mode,
 				models: hive.models,
 				doneCount: hive.doneCount,
 				totalCount: hive.totalCount,
 				startTime: hive.startTime,
 			};
-			// Write hive:state for crash recovery
 			this.pi.appendEntry("hive:state", state);
-			// Write hive:result with full model data on completion (enables cross-module hive_read)
-			if (hive.status === "completed" || hive.status === "error" || hive.status === "timeout") {
-				const rawResults = [...hive.results.values()].map((r) => ({
-					model: r.model,
-					exitCode: r.exitCode,
-					durationMs: r.durationMs,
-					text: getFinalOutput(r.messages),
-					errorMessage: r.errorMessage,
-					usage: r.usage,
-				}));
-				this.pi.appendEntry("hive:result", { sessionId: hive.sessionId, results: rawResults });
+
+			if (this.isFinished(hive.status)) {
+				this.pi.appendEntry("hive:result", {
+					sessionId: hive.sessionId,
+					verdict: hive.outcome ? renderOutcome(hive.outcome) : undefined,
+					results: hive.results.map((r) => ({
+						model: r.model,
+						stage: r.stage,
+						exitCode: r.exitCode,
+						durationMs: r.durationMs,
+						text: getFinalOutput(r.messages),
+						errorMessage: r.errorMessage,
+						usage: r.usage,
+					})),
+				});
 			}
 		} catch { /* best-effort */ }
 	}
@@ -669,36 +447,25 @@ class BackgroundProcessManager {
 		const existing = this.hives.get(data.sessionId);
 		if (existing && existing.status !== "lost") return; // already restored
 
-		const hive: BackgroundHive = {
+		// A hive recorded as running cannot be running now: its subprocesses died
+		// with the previous process. It is marked lost rather than resumed.
+		this.hives.set(data.sessionId, {
 			sessionId: data.sessionId,
-			status: data.status === "running" ? "lost" : data.status, // running=lost after crash
+			status: data.status === "running" || data.status === "launched" ? "lost" : data.status,
 			question: data.question,
-			mode: data.mode,
 			models: data.models,
-			results: new Map(),
-			subprocesses: [],
+			// Restored hives carry no node results: only the rendered text was
+			// persisted, and fabricating ModelResult shells here would hand
+			// getFinalOutput a message list that does not exist.
+			results: [],
+			abort: new AbortController(),
 			startTime: data.startTime,
+			endTime: Date.now(),
 			budgetMs: HIVE_BUDGET_MS_DEFAULT,
-			notified: data.status === "completed",
+			notified: true, // already reported in the session it completed in
 			doneCount: data.doneCount,
 			totalCount: data.totalCount,
-			cwd: "",
-			context: "",
-			history: "",
-		};
-
-		if (data.results) {
-			for (const r of data.results) {
-				hive.results.set(r.model, r);
-			}
-		}
-
-		this.hives.set(data.sessionId, hive);
-
-		// Notify if completed
-		if (hive.status === "completed" && !hive.notified) {
-			setTimeout(() => this.emitHiveComplete(), 1000);
-		}
+		});
 	}
 
 	// -----------------------------------------------------------------------
@@ -711,27 +478,24 @@ class BackgroundProcessManager {
 			clearInterval(this.watchdogTimer);
 			this.watchdogTimer = null;
 		}
-		for (const hive of this.hives.values()) {
-			for (const proc of hive.subprocesses) {
-				try { proc.kill("SIGTERM"); } catch { /* dead */ }
-			}
-		}
-		this.queue = [];
+		for (const hive of this.hives.values()) hive.abort.abort();
 		this.hives.clear();
 	}
-
-	// -----------------------------------------------------------------------
-	// Accessibility for extension files
-	// -----------------------------------------------------------------------
 
 	setProgressHandler(handler: OnProgress | null) {
 		this.onProgress = handler;
 	}
+
+	/** True once session_shutdown has run; callers should stop launching. */
+	get isShuttingDown(): boolean {
+		return this.shutdown;
+	}
 }
 
-// Export via globalThis to ensure all extension files share the same singleton
-// (pi loads each extension file as a separate module instance)
+// Exported via globalThis so every extension file shares one instance — pi loads
+// each extension as a separate module.
 const GLOBAL_KEY = Symbol.for("pi.hive.backgroundManager");
 const _g = globalThis as any;
-export const backgroundManager: BackgroundProcessManager = _g[GLOBAL_KEY] || (_g[GLOBAL_KEY] = BackgroundProcessManager.getInstance());
+export const backgroundManager: BackgroundProcessManager =
+	_g[GLOBAL_KEY] || (_g[GLOBAL_KEY] = BackgroundProcessManager.getInstance());
 export { BackgroundProcessManager };

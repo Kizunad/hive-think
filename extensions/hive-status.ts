@@ -34,10 +34,12 @@ export default function (pi: ExtensionAPI) {
 							sessionId,
 							status: data.status || "completed",
 							question: data.question || "",
-							mode: data.mode || "",
 							models: data.models || [],
+							stage: data.stage,
 							doneCount: data.doneCount ?? 0,
-							totalCount: data.totalCount ?? 14,
+							// No fixed roster size to fall back on — the fan-out is decided at
+							// run time — so an unknown total reads as however many are done.
+							totalCount: data.totalCount ?? data.doneCount ?? 0,
 							durationMs: Date.now() - (data.startTime || Date.now()),
 						};
 						break;
@@ -53,23 +55,31 @@ export default function (pi: ExtensionAPI) {
 
 			const progressBar = (done: number, total: number) => {
 				const width = 10;
-				const filled = Math.round((done / total) * width);
+				// total is 0 until the first stage reports, and the fan-out grows
+				// mid-run, so clamp instead of trusting the ratio.
+				const ratio = total > 0 ? Math.min(1, done / total) : 0;
+				const filled = Math.round(ratio * width);
 				return `[${"█".repeat(filled)}${"░".repeat(width - filled)}]`;
 			};
 
 			const durationS = (status.durationMs / 1000).toFixed(1);
+			const remaining = Math.max(0, status.totalCount - status.doneCount);
 			const lines = [
 				`🐝 Hive \`${status.sessionId}\` — **${status.status}**`,
-				`Mode: ${status.mode} · Models: ${status.totalCount} · Elapsed: ${durationS}s`,
+				`Stage: ${status.stage ?? "(starting)"} · Elapsed: ${durationS}s`,
 				`Progress: ${progressBar(status.doneCount, status.totalCount)} ${status.doneCount}/${status.totalCount} nodes`,
 				"",
 				status.status === "completed"
 					? `✅ Complete! Use \`hive_read({ sessionId: "${sessionId}" })\` to get results.`
 					: status.status === "running" || status.status === "launched"
-						? `⏳ Still running... ${status.totalCount - status.doneCount} nodes remaining.`
+						? // The node count is decided after decomposition and grows per stage,
+							// so this is the current stage's remainder, not the whole run's.
+							`⏳ Still running — ${remaining} node${remaining === 1 ? "" : "s"} left in this stage.`
 						: status.status === "timeout"
 							? `⏱ Budget exceeded. Results may be partial. Use \`hive_read({ sessionId: "${sessionId}" })\` to get what's available.`
-							: `⚠ Status: ${status.status}`,
+							: status.status === "aborted"
+								? `⚠ Aborted. Whatever finished is still collectable with \`hive_read({ sessionId: "${sessionId}" })\`.`
+								: `⚠ Status: ${status.status}`,
 			];
 
 			return {

@@ -40,8 +40,11 @@ export default function (pi: ExtensionAPI) {
 							sessionId: sid,
 							status: data.status || "running",
 							question: data.question ? data.question.slice(0, 80) : "(background hive)",
+							stage: data.stage,
 							doneCount: data.doneCount ?? 0,
-							totalCount: data.totalCount ?? 14,
+							// The fan-out is decided at run time, so there is no roster size to
+							// assume for a session we are only reading back from disk.
+							totalCount: data.totalCount ?? data.doneCount ?? 0,
 						});
 					}
 				}
@@ -60,7 +63,8 @@ export default function (pi: ExtensionAPI) {
 					h.status === "running" || h.status === "launched" ? "⏳" :
 					h.status === "timeout" ? "⏱" :
 					h.status === "aborted" ? "🛑" : "⚠";
-				lines.push(`${icon} \`${h.sessionId}\` **${h.status}** — ${h.doneCount}/${h.totalCount} nodes`);
+				const stageTag = h.stage ? ` · ${h.stage}` : "";
+				lines.push(`${icon} \`${h.sessionId}\` **${h.status}** — ${h.doneCount}/${h.totalCount} nodes${stageTag}`);
 				lines.push(`  > ${h.question.slice(0, 100)}${h.question.length > 100 ? "..." : ""}`);
 				if (h.status === "completed") {
 					lines.push(`  Ready: \`hive_read({ sessionId: "${h.sessionId}" })\``);
